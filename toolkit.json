@@ -1,0 +1,38 @@
+{
+  "slug": "monday-c3-po-extractor",
+  "display_name": "Monday C3 PO Extractor",
+  "description": "Given a Monday.com item_id or item_ids, fetches the Updates (email) section for those items and extracts all PO numbers from the 'Purchase Order Number' column of any table in the update body.",
+  "version": "0.2.0",
+  "entrypoint": {
+    "type": "python",
+    "command": "python main.py"
+  },
+  "capabilities": [
+    {
+      "name": "extract_c3_po_numbers",
+      "description": "Fetches the Updates (email body) for the given item_id(s), parses any table that has a 'Purchase Order Number' column, and returns all PO numbers per item. Accepts item_id (single) or item_ids (array).",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "item_id": {
+            "type": "integer",
+            "description": "Single Monday.com item (pulse) ID. Use this or item_ids."
+          },
+          "item_ids": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "description": "Multiple Monday.com item (pulse) IDs for batch results."
+          },
+          "api_token": {
+            "type": "string",
+            "description": "Monday.com API token. If omitted, MONDAY_API_TOKEN environment variable is used.",
+            "nullable": true
+          }
+        },
+        "required": []
+      }
+    }
+  ],
+  "author": "Toolkit Author",
+  "tags": ["monday", "c3", "sobeys", "po", "extractor", "rpa", "appointment"]
+}
