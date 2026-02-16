@@ -1,8 +1,8 @@
 {
   "slug": "monday-c3-po-extractor",
   "display_name": "Monday C3 PO Extractor",
-  "description": "Given a Monday.com item_id or item_ids, fetches the Updates (email) section for those items and extracts all PO numbers from the 'Purchase Order Number' column of any table in the update body.",
-  "version": "0.2.0",
+  "description": "Extracts PO numbers and full appointment details (appointment_number, client, consignee, appointment_date_time, c3_response, po_numbers) from Monday.com C3 board updates. Supports Sobeys and Loblaw email formats.",
+  "version": "0.3.0",
   "entrypoint": {
     "type": "python",
     "command": "python main.py"
@@ -10,30 +10,32 @@
   "capabilities": [
     {
       "name": "extract_c3_po_numbers",
-      "description": "Fetches the Updates (email body) for the given item_id(s), parses any table that has a 'Purchase Order Number' column, and returns all PO numbers per item. Accepts item_id (single) or item_ids (array).",
+      "description": "Fetches the Updates (email body) for the given item_id(s), parses any table that has a 'Purchase Order Number' column, and returns all PO numbers per item.",
       "schema": {
         "type": "object",
         "properties": {
-          "item_id": {
-            "type": "integer",
-            "description": "Single Monday.com item (pulse) ID. Use this or item_ids."
-          },
-          "item_ids": {
-            "type": "array",
-            "items": { "type": "integer" },
-            "description": "Multiple Monday.com item (pulse) IDs for batch results."
-          },
-          "api_token": {
-            "type": "string",
-            "description": "Monday.com API token. If omitted, MONDAY_API_TOKEN environment variable is used.",
-            "nullable": true
-          }
+          "item_id": { "type": "integer", "description": "Single Monday.com item (pulse) ID." },
+          "item_ids": { "type": "array", "items": { "type": "integer" }, "description": "Multiple item IDs for batch results." },
+          "api_token": { "type": "string", "nullable": true }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "extract_c3_appointment_details",
+      "description": "Fetches first N rows from C3 board where Row Type is empty; extracts appointment_number, client, consignee, appointment_date_time, c3_response, po_numbers from Sobeys or Loblaw emails.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "api_token": { "type": "string", "nullable": true },
+          "board_id": { "type": "integer", "description": "Default 18392325187.", "nullable": true },
+          "group_name": { "type": "string", "description": "Default C3 Inbox.", "nullable": true },
+          "limit": { "type": "integer", "description": "Max rows (Row Type empty). Default 5.", "nullable": true }
         },
         "required": []
       }
     }
   ],
-  "author": "neehar",
-  "tags": ["monday", "c3", "sobeys", "po", "extractor", "rpa", "appointment"]
+  "author": "Toolkit Author",
+  "tags": ["monday", "c3", "sobeys", "loblaw", "po", "extractor", "rpa", "appointment"]
 }
-
