@@ -6,10 +6,13 @@ Monday C3 PO Extractor Toolkit.
 - extract_c3_po_numbers: Given item_id(s), extracts PO numbers from the "Purchase Order Number"
   column in update body tables.
 - extract_c3_appointment_details: Fetches first N rows from the C3 board where Row Type is empty,
-  and extracts 6 fields (Appointment number, Client, Consignee, Appointment Date and time,
-  C3 Response, PO's) from Sobeys or Loblaw email format.
+  and extracts appointment number, Client, Consignee, Appointment Date and time, C3 Response, POs
+  from Sobeys or Loblaw email format. When config_path is provided, also looks up Altruos Shipment ID
+  (per PO via shipments/search) and Altruos Load ID (per Shipment ID via movements/search/shipments)
+  and populates those Monday columns; the output CSV includes shipment_id and load_id per PO row.
 """
 
+import csv
 import json
 import os
 import re
@@ -19,8 +22,29 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
-# Filename for saving extracted appointment items (in user Downloads)
-NEW_RECORDS_FILENAME = "new_records.txt"
+try:
+    from requests_aws4auth import AWS4Auth
+    _HAS_AWS4AUTH = True
+except ImportError:
+    _HAS_AWS4AUTH = False
+
+# Filename for saving extracted appointment items (user Downloads) as CSV, one row per PO
+NEW_RECORDS_FILENAME = "new_records.csv"
+
+# CSV column headers (one row per PO; date=YYYYMMDD, delivery_time=HHMMSS)
+CSV_HEADERS = [
+    "item_id",
+    "appointment_number",
+    "client",
+    "consignee",
+    "appointment_date",
+    "delivery_time",
+    "c3_response",
+    "po",
+    "shipment_id",
+    "load_id",
+    "row_type",
+]
 
 
 CAPABILITY_NAME = "extract_c3_po_numbers"
@@ -45,10 +69,16 @@ COL_APPOINTMENT_DATE = "Appointment Date"
 COL_REQUESTED_DELIVERY_APPOINTMENT = "Requested Delivery Appointment"
 COL_PO = "PO"
 COL_C3_RESPONSE = "C3 Response"
+COL_ALTRUOS_SHIPMENT_ID = "Altruos Shipment ID"
+COL_ALTRUOS_LOAD_ID = "Altruos Load ID"
 
 # C3 Response: raw label from email -> Monday column label (status)
-# Sobeys
+# Standard subject lines (dates/times/numbers vary); match is case-insensitive and allows suffixes like "(POs Added/Removed)", "[Scheduled Date/Time...]", " notification".
+# Sobeys: Reservation Approval->Approved, Update->Update, No Show Appointment->No show, Missing/Incorrect paperwork->Missing/Incorrect Paperwork, Signed paperwork->Signed Paperwork
+# Loblaw: Appointment Confirmation Approved->Approved, Appointment Cancellation Request Approved->Cancelled, Appointment Rejection->Rejected, No Show Notification->No Show,
+#         Amendment Accepted (any variant)->Amendment Accepted
 C3_RESPONSE_MAP = {
+    # Sobeys
     "reservation approval": "Approved",
     "update": "Update",
     "no show appointment": "No show",
@@ -67,13 +97,49 @@ PO_COLUMN_HEADER = "purchase order number"
 
 
 def _map_c3_response_to_column_label(raw: Optional[str]) -> Optional[str]:
-    """Map raw C3 response from email to Monday C3 Response column label. Match is case-insensitive, stripped."""
+    """Map raw C3 response from email to Monday C3 Response column label.
+    Match is case-insensitive; raw may have prefixes/suffixes (e.g. 'Amendment Accepted (POs Added/Removed)').
+    Uses longest matching key so 'Appointment Cancellation Request Approved' wins over 'Appointment Confirmation'."""
     if not raw or not isinstance(raw, str):
         return None
-    key = raw.strip().lower()
-    if not key:
+    normalized = raw.strip().lower()
+    if not normalized:
         return None
-    return C3_RESPONSE_MAP.get(key) or C3_RESPONSE_MAP.get(key.replace("  ", " "))
+    # Exact match first
+    if normalized in C3_RESPONSE_MAP:
+        return C3_RESPONSE_MAP[normalized]
+    # Else find keys that are contained in the raw string; use longest match
+    best_key: Optional[str] = None
+    for key in sorted(C3_RESPONSE_MAP.keys(), key=len, reverse=True):
+        if key in normalized:
+            best_key = key
+            break
+    return C3_RESPONSE_MAP[best_key] if best_key else None
+
+
+def _format_appointment_date_time_for_csv(value: Optional[str]) -> Tuple[str, str]:
+    """
+    Parse '15/01/2026 13:00 EST' or '2026/01/15 13:00 EST' and return (date_yyyymmdd, time_hhmmss).
+    Date format: YYYYMMDD e.g. 20260115. Time format: HHMMSS e.g. 130000.
+    Returns ('', '') if unparseable.
+    """
+    if not value or not isinstance(value, str):
+        return ("", "")
+    value = value.strip()
+    # Match date and time: DD/MM/YYYY or YYYY/MM/DD, then optional HH:MM or HH:MM:SS
+    m = re.match(r"(\d{4})/(\d{2})/(\d{2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?", value)
+    if m:
+        y, mo, d, h, mi, sec = m.groups()
+        date_str = f"{y}{mo}{d}"
+        time_str = f"{int(h):02d}{mi}{(sec or '00')}"
+        return (date_str, time_str)
+    m = re.match(r"(\d{2})/(\d{2})/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?", value)
+    if m:
+        d, mo, y, h, mi, sec = m.groups()
+        date_str = f"{y}{mo}{d}"
+        time_str = f"{int(h):02d}{mi}{(sec or '00')}"
+        return (date_str, time_str)
+    return ("", "")
 
 
 def _get_downloads_path() -> Path:
@@ -86,16 +152,61 @@ def _get_downloads_path() -> Path:
     return Path(base) / "Downloads"
 
 
-def _save_items_to_downloads(items: List[Dict[str, Any]], filename: str = NEW_RECORDS_FILENAME) -> str:
+def _items_to_csv_rows(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """
-    Save items as JSON text to a file in the user's Downloads folder.
+    Expand items to one row per PO: same item fields duplicated, with a single 'po' per row.
+    Date as YYYYMMDD, time as HHMMSS in separate columns. Includes shipment_id and load_id
+    when po_details is present. If an item has no POs, output one row with po empty.
+    """
+    rows: List[Dict[str, str]] = []
+    for it in items:
+        raw_datetime = str(it.get("appointment_date_time") or "")
+        appointment_date, delivery_time = _format_appointment_date_time_for_csv(raw_datetime)
+        base = {
+            "item_id": str(it.get("item_id") or ""),
+            "appointment_number": str(it.get("appointment_number") or ""),
+            "client": str(it.get("client") or ""),
+            "consignee": str(it.get("consignee") or ""),
+            "appointment_date": appointment_date,
+            "delivery_time": delivery_time,
+            "c3_response": str(it.get("c3_response") or ""),
+            "row_type": str(it.get("row_type") or ""),
+        }
+        po_details = it.get("po_details") or []
+        if po_details:
+            for detail in po_details:
+                rows.append({
+                    **base,
+                    "po": str(detail.get("po") or "").strip(),
+                    "shipment_id": str(detail.get("shipment_id") or "").strip(),
+                    "load_id": str(detail.get("load_id") or "").strip(),
+                })
+        else:
+            pos = it.get("po_numbers") or []
+            if not pos:
+                rows.append({**base, "po": "", "shipment_id": "", "load_id": ""})
+            else:
+                for po in pos:
+                    rows.append({**base, "po": str(po).strip(), "shipment_id": "", "load_id": ""})
+    return rows
+
+
+def _save_items_as_csv_to_downloads(
+    items: List[Dict[str, Any]],
+    filename: str = NEW_RECORDS_FILENAME,
+) -> str:
+    """
+    Save items as CSV in the user's Downloads folder: one row per PO, headers as column names.
     Returns the absolute path of the saved file.
     """
     folder = _get_downloads_path()
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / filename
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(items, f, indent=2, ensure_ascii=False)
+    rows = _items_to_csv_rows(items)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        writer.writeheader()
+        writer.writerows(rows)
     return str(path.resolve())
 
 
@@ -108,6 +219,187 @@ def _get_api_token(api_token: Optional[str]) -> str:
             "Pass 'api_token' in args or set MONDAY_API_TOKEN environment variable."
         )
     return token
+
+
+def _load_altruos_config(config_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Load Altruos API config from JSON file. Returns None if config_path is empty."""
+    if not config_path or not str(config_path).strip():
+        return None
+    path = Path(config_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    base_url = (config.get("baseUrl") or "").strip().rstrip("/")
+    if not base_url:
+        raise ValueError("Config must contain 'baseUrl'")
+    return {**config, "baseUrl": base_url + "/"}
+
+
+def _altruos_auth_and_headers(config: Dict[str, Any]) -> Tuple[Dict[str, str], Optional[Any]]:
+    """Build headers and optional AWS4Auth for Altruos API (same as test_altruos_search.py)."""
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": str(config.get("apiKey") or ""),
+    }
+    auth = None
+    if _HAS_AWS4AUTH:
+        access_key = (config.get("accessKey") or "").strip()
+        secret_key = (config.get("secretKey") or "").strip()
+        if access_key and secret_key:
+            region = (config.get("region") or "ca-central-1").strip()
+            service = (config.get("service") or "execute-api").strip()
+            auth = AWS4Auth(access_key, secret_key, region, service)
+    return headers, auth
+
+
+def _altruos_post(
+    config: Dict[str, Any],
+    path: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """POST to Altruos API; path is relative to baseUrl (e.g. 'shipments/search')."""
+    url = (config.get("baseUrl") or "").rstrip("/") + "/" + path.lstrip("/")
+    headers, auth = _altruos_auth_and_headers(config)
+    response = requests.post(url, headers=headers, json=payload, auth=auth, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def _altruos_post_with_debug(
+    config: Dict[str, Any],
+    path: str,
+    payload: Dict[str, Any],
+    debug_list: List[Dict[str, Any]],
+) -> Optional[Any]:
+    """
+    POST to Altruos API and append request/response to debug_list.
+    Returns response data (dict or list) on success, None on failure. Debug entry includes
+    endpoint, url, request_json, response_json, response_status_code, and error (if any).
+    """
+    url = (config.get("baseUrl") or "").rstrip("/") + "/" + path.lstrip("/")
+    request_json = json.loads(json.dumps(payload))
+    entry: Dict[str, Any] = {
+        "endpoint": path,
+        "url": url,
+        "request_json": request_json,
+        "response_json": None,
+        "response_status_code": None,
+        "error": None,
+    }
+    try:
+        headers, auth = _altruos_auth_and_headers(config)
+        response = requests.post(
+            url, headers=headers, json=payload, auth=auth, timeout=30
+        )
+        raw_text = response.text
+        entry["response_status_code"] = response.status_code
+        try:
+            response_data = response.json()
+        except Exception:
+            response_data = raw_text
+        entry["response_json"] = response_data
+        response.raise_for_status()
+        debug_list.append(entry)
+        return response_data
+    except Exception as e:
+        entry["error"] = str(e)
+        debug_list.append(entry)
+        return None
+
+
+def _altruos_shipment_id_by_po(
+    config: Dict[str, Any],
+    po: str,
+    debug_list: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """Look up Altruos Shipment ID by PO number. Returns first shipment id or None.
+    If debug_list is provided, appends one entry with request/response for this call."""
+    if not (po or str(po).strip()):
+        return None
+    po_str = str(po).strip()
+    payload = {"purchase_order": po_str}
+    if debug_list is not None:
+        data = _altruos_post_with_debug(config, "shipments/search", payload, debug_list)
+        if data is None:
+            return None
+    else:
+        try:
+            data = _altruos_post(config, "shipments/search", payload)
+        except Exception:
+            return None
+    # Use only "shipment_id" label from response; if not found leave blank
+    if isinstance(data, list) and len(data) > 0:
+        first = data[0]
+        sid = first.get("shipment_id")
+        return str(sid) if sid is not None else None
+    if isinstance(data, dict):
+        sid = data.get("shipment_id")
+        if sid is not None:
+            return str(sid)
+        items = data.get("shipments") or data.get("data") or []
+        if items and isinstance(items, list):
+            first = items[0]
+            sid = first.get("shipment_id")
+            return str(sid) if sid is not None else None
+    return None
+
+
+def _altruos_load_id_by_shipment_id(
+    config: Dict[str, Any],
+    shipment_id: str,
+    debug_list: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """Look up Altruos Load ID by Shipment ID. Returns first load id or None.
+    If debug_list is provided, appends one entry with request/response for this call."""
+    if not (shipment_id or str(shipment_id).strip()):
+        return None
+    try:
+        sid_int = int(shipment_id)
+    except (TypeError, ValueError):
+        return None
+    payload = {"movement": {"shipment_ids": [sid_int]}}
+    if debug_list is not None:
+        data = _altruos_post_with_debug(
+            config, "movements/search/shipments", payload, debug_list
+        )
+        if data is None:
+            return None
+    else:
+        try:
+            data = _altruos_post(
+                config,
+                "movements/search/shipments",
+                payload,
+            )
+        except Exception:
+            return None
+    # Use only "load_id" label from response (result_list[].movement.header.load_id); if not found leave blank
+    if isinstance(data, list) and len(data) > 0:
+        first = data[0]
+        lid = _extract_load_id_from_movement_item(first)
+        return str(lid) if lid is not None else None
+    if isinstance(data, dict):
+        result_list = data.get("result_list") or []
+        if result_list and isinstance(result_list, list):
+            first = result_list[0]
+            lid = _extract_load_id_from_movement_item(first)
+            return str(lid) if lid is not None else None
+    return None
+
+
+def _extract_load_id_from_movement_item(item: Dict[str, Any]) -> Optional[str]:
+    """Extract only 'load_id' from result_list[].movement.header; if not present return None."""
+    if not isinstance(item, dict):
+        return None
+    movement = item.get("movement")
+    if not isinstance(movement, dict):
+        return None
+    header = movement.get("header")
+    if not isinstance(header, dict):
+        return None
+    load_id = header.get("load_id")
+    return str(load_id) if load_id is not None else None
 
 
 def _monday_graphql(
@@ -237,19 +529,22 @@ def _extract_po_numbers_from_update_body(body: str) -> List[str]:
     return pos
 
 
-# ---- Sobeys subject: "Client - C3 Response [for|:] APPT_NO on DATE for Consignee" ----
-# Example 1: Sobeys - Update for 46554663 on 2026/01/14 05:00 AST for Oromocto RSC29
-# Example 2: Sobeys - Reservation Approval: 46578951 on 2026/01/14 02:50 CST for Winnipeg RSC08
-# C3 Response can be followed by " for " or ":" (optional space after colon) then number
+# ---- Sobeys subject ----
+# Full: "Sobeys - C3 Response for NUMBER on DATE for Consignee" or "Sobeys - C3 Response: NUMBER on DATE for Consignee"
+# Notification-only: "Sobeys - No Show Appointment notification" / "Sobeys - Missing/Incorrect paperwork notification" / "Sobeys - Signed paperwork notification"
 SOBEYS_SUBJECT_RE = re.compile(
     r"^(.+?)\s+-\s+(.+?)\s*(?:for\s+|:\s*)(\d+)\s+on\s+(.+?)\s+for\s+(.+)$",
     re.IGNORECASE | re.DOTALL,
+)
+SOBEYS_SUBJECT_NOTIFICATION_RE = re.compile(
+    r"^Sobeys\s+-\s+(.+)$",
+    re.IGNORECASE,
 )
 
 
 def _parse_sobeys_subject(subject: str) -> Dict[str, Optional[str]]:
     """
-    Parse Sobeys email subject.
+    Parse Sobeys email subject (full format with appt/date/consignee, or notification-only).
     Returns dict: appointment_number, client, consignee, appointment_date_time, c3_response, po_numbers (None; filled from body).
     """
     out = {
@@ -264,21 +559,27 @@ def _parse_sobeys_subject(subject: str) -> Dict[str, Optional[str]]:
         return out
     subject = subject.strip()
     m = SOBEYS_SUBJECT_RE.match(subject)
-    if not m:
+    if m:
+        client, c3_response, appt_no, date_time, consignee = m.groups()
+        out["client"] = (client or "").strip()
+        out["c3_response"] = (c3_response or "").strip()
+        out["appointment_number"] = (appt_no or "").strip()
+        out["appointment_date_time"] = (date_time or "").strip()
+        out["consignee"] = (consignee or "").strip()
         return out
-    client, c3_response, appt_no, date_time, consignee = m.groups()
-    out["client"] = (client or "").strip()
-    out["c3_response"] = (c3_response or "").strip()
-    out["appointment_number"] = (appt_no or "").strip()
-    out["appointment_date_time"] = (date_time or "").strip()
-    out["consignee"] = (consignee or "").strip()
+    # Fallback: notification-only subject (e.g. "Sobeys - No Show Appointment notification")
+    m2 = SOBEYS_SUBJECT_NOTIFICATION_RE.match(subject)
+    if m2:
+        out["client"] = "Sobeys"
+        out["c3_response"] = (m2.group(1) or "").strip()
     return out
 
 
-# ---- Loblaw subject: "C3 Response - from Client Appointing: ..." ----
-# Example: Appointment Confirmation Approved - from Loblaw Appointing: for Matrix Calgary DC on 16/01/2026 14:30 MST
+# ---- Loblaw subject ----
+# Standard: "C3 Response - from Loblaw Appointing: ..." or "C3 Response from Loblaw Appointing: ..." (with/without hyphen, optional brackets/suffix)
+# Examples: "Appointment Confirmation Approved - from Loblaw Appointing: ...", "Appointment Rejection from Loblaw Appointing - ref# ...", "No Show Notification from Loblaw Appointing: ..."
 LOBLAW_C3_CLIENT_RE = re.compile(
-    r"^(.+?)\s+-\s+from\s+(.+?)(?:\s+Appointing|\s*:|\s*$)",
+    r"^(.+?)(?:\s*-\s*from|\s+from)\s+(.+?)(?:\s+Appointing|\s*:|\s*$)",
     re.IGNORECASE,
 )
 
@@ -302,6 +603,15 @@ def _parse_loblaw_subject(subject: str) -> Dict[str, Optional[str]]:
         out["c3_response"] = (c3_response or "").strip()
         out["client"] = (client or "").strip()
     return out
+
+
+def _extract_loblaw_reference_number_from_body(body: str) -> Optional[str]:
+    """Extract Reference # from Loblaw email body (Updates section). Uses _strip_html like _parse_loblaw_body."""
+    if not body or not isinstance(body, str):
+        return None
+    text = _strip_html(body).replace("\r\n", "\n")
+    ref_m = re.search(r"Reference\s*#\s*:\s*(\d+)", text, re.IGNORECASE)
+    return ref_m.group(1).strip() if ref_m else None
 
 
 # ---- Loblaw body: key-value pairs (Reference #, Scheduled Date, Warehouse, PO(s)) ----
@@ -588,6 +898,8 @@ def _update_item_with_extracted_columns(
     _set(COL_APPOINTMENT_DATE, extracted.get("appointment_date_time"))
     _set(COL_REQUESTED_DELIVERY_APPOINTMENT, extracted.get("appointment_date_time"))
     _set(COL_PO, extracted.get("po_numbers") or [])
+    _set(COL_ALTRUOS_SHIPMENT_ID, extracted.get("shipment_ids") or [])
+    _set(COL_ALTRUOS_LOAD_ID, extracted.get("load_ids") or [])
 
     # C3 Response is status type - map raw label to column label and set
     c3_response_label = _map_c3_response_to_column_label(extracted.get("c3_response"))
@@ -651,7 +963,11 @@ def _fetch_loblaw_items_past_weeks(
     board_id: int,
     weeks: int = 2,
 ) -> List[Dict[str, Any]]:
-    """Fetch items where name contains 'Loblaw' and created within the last N weeks. Fallback: all Loblaw by name."""
+    """
+    Fetch all items where name contains 'Loblaw' and created within the last N weeks
+    (Update section). Paginates through every page so we can compare Reference # across
+    all such rows for New vs Update. Fallback: all Loblaw by name (no date filter).
+    """
     try:
         query = """
         query LoblawItems($boardIds: [ID!]!, $limit: Int!, $queryParams: QueryParamsInput) {
@@ -663,6 +979,8 @@ def _fetch_loblaw_items_past_weeks(
           }
         }
         """
+        # Same rules as user query: name contains Loblaw + pulse_log within last 2 weeks (CREATED_AT).
+        # order_by __creation_log__ so items come oldest first (oldest row = New, newer duplicates = Update).
         query_params = {
             "rules": [
                 {"column_id": "name", "compare_value": ["Loblaw"], "operator": "contains_text"},
@@ -674,6 +992,7 @@ def _fetch_loblaw_items_past_weeks(
                 },
             ],
             "operator": "and",
+            "order_by": [{"column_id": "__creation_log__"}],
         }
         variables = {
             "boardIds": [board_id],
@@ -686,7 +1005,8 @@ def _fetch_loblaw_items_past_weeks(
         items = page.get("items") or []
         all_items = list(items)
         cursor = page.get("cursor")
-        while cursor and items:
+        # Paginate through all pages: keep requesting while cursor is present
+        while cursor:
             next_result = _monday_graphql(
                 api_token,
                 """
@@ -716,12 +1036,16 @@ def _fetch_loblaw_items_past_weeks(
         return all_items
 
 
-def _get_loblaw_reference_number_counts(
+def _get_loblaw_oldest_item_id_per_reference(
     api_token: str,
     board_id: int,
     weeks: int = 2,
-) -> Dict[str, int]:
-    """For Loblaw items in past N weeks, extract Reference # from each item's updates; return ref_number -> count."""
+) -> Dict[str, str]:
+    """
+    For all Loblaw rows in the past N weeks (ordered oldest first), extract Reference #
+    from each item's updates. Returns ref_number -> item_id of the OLDEST item with that ref.
+    That item gets Row Type "New"; all other items with the same ref get "Update".
+    """
     loblaw_items = _fetch_loblaw_items_past_weeks(api_token, board_id, weeks)
     if not loblaw_items:
         return {}
@@ -729,17 +1053,22 @@ def _get_loblaw_reference_number_counts(
     updates_by_item: Dict[str, List[Dict[str, Any]]] = {}
     for i in range(0, len(item_ids), 50):
         updates_by_item.update(_fetch_updates_for_items(api_token, item_ids[i : i + 50]))
-    counts: Dict[str, int] = {}
+    # Items are in creation order (oldest first). First item_id we see for each ref # is the oldest.
+    # Use _strip_html so we match "Reference #:" in HTML email bodies (same as _parse_loblaw_body).
+    ref_to_oldest_item_id: Dict[str, str] = {}
     for iid in item_ids:
         for upd in updates_by_item.get(iid) or []:
             body = (upd.get("body") or "").strip()
             if not body:
                 continue
-            ref_m = re.search(r"Reference\s*#\s*:\s*(\d+)", body, re.IGNORECASE)
+            text = _strip_html(body).replace("\r\n", "\n")
+            ref_m = re.search(r"Reference\s*#\s*:\s*(\d+)", text, re.IGNORECASE)
             if ref_m:
                 ref = ref_m.group(1).strip()
-                counts[ref] = counts.get(ref, 0) + 1
-    return counts
+                if ref not in ref_to_oldest_item_id:
+                    ref_to_oldest_item_id[ref] = iid
+                break  # one ref per item (use first update that has it)
+    return ref_to_oldest_item_id
 
 
 def _extract_po_numbers_for_item(updates: List[Dict[str, Any]]) -> Tuple[List[str], int]:
@@ -823,17 +1152,21 @@ def extract_c3_appointment_details(
     board_id: Optional[int] = None,
     group_name: Optional[str] = None,
     limit: int = DEV_LIMIT_ROWS,
+    config_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Fetches items from the C3 board where Row Type is empty (first N rows in dev),
-    and extracts 6 fields per item: appointment_number, client, consignee,
-    appointment_date_time, c3_response, po_numbers. Supports Sobeys and Loblaw email formats.
+    and extracts appointment_number, client, consignee, appointment_date_time, c3_response,
+    po_numbers. When config_path is provided, also looks up Altruos Shipment ID and Load ID
+    via API (PO -> shipments/search, Shipment ID -> movements/search/shipments).
+    Supports Sobeys and Loblaw email formats.
     """
     try:
         token = _get_api_token(api_token)
         bid = board_id if board_id is not None else DEFAULT_BOARD_ID
         group_filter = (group_name or DEFAULT_GROUP_NAME).strip()
         max_items = max(1, min(limit, 50))
+        altruos_config = _load_altruos_config(config_path)
 
         # Resolve column ids from board (for Row Type filter and for populating extracted values)
         columns = _fetch_board_columns(token, bid)
@@ -893,11 +1226,30 @@ def extract_c3_appointment_details(
             batch = item_ids[i : i + 50]
             updates_by_item.update(_fetch_updates_for_items(token, batch))
 
-        # Precompute Loblaw Reference # counts (past 2 weeks) for New vs Update
-        loblaw_ref_counts = _get_loblaw_reference_number_counts(token, bid, weeks=2)
+        # Precompute for Loblaw: ref # -> oldest item_id (past 2 weeks, creation order). That item = New, others = Update.
+        loblaw_oldest_item_id_per_ref = _get_loblaw_oldest_item_id_per_reference(token, bid, weeks=2)
+
+        # First-appended row (bottom of board) gets "New"; others get "Update".
+        # Process bottom-to-top: items_to_process[0]=top (newest), [-1]=bottom (oldest). So reversed = bottom first.
+        ref_to_oldest_in_batch: Dict[str, str] = {}
+        for item in reversed(items_to_process):
+            name = (item.get("name") or "").strip()
+            if "Loblaw" not in name:
+                continue
+            iid = str(item.get("id", ""))
+            for upd in updates_by_item.get(iid) or []:
+                body = (upd.get("body") or "").strip()
+                ref = _extract_loblaw_reference_number_from_body(body) if body else None
+                if ref and ref not in ref_to_oldest_in_batch:
+                    ref_to_oldest_in_batch[ref] = iid
+                if ref:
+                    break
+        # Prefer batch order: for refs in this batch, "New" = first in bottom-to-top order (bottom row)
+        for ref, iid in ref_to_oldest_in_batch.items():
+            loblaw_oldest_item_id_per_ref[ref] = iid
 
         results: List[Dict[str, Any]] = []
-        for item in items_to_process:
+        for item in reversed(items_to_process):
             iid = str(item.get("id", ""))
             name = (item.get("name") or "").strip()
             updates = updates_by_item.get(iid) or []
@@ -943,15 +1295,46 @@ def extract_c3_appointment_details(
                 consignee = parsed_body.get("consignee")
                 po_numbers = _merge_loblaw_po_from_table(body, parsed_body.get("po_numbers"))
 
-            # Determine Row Type: New (appointment number appears once) or Update (repeats)
+            # Determine Row Type: New (oldest occurrence) or Update (newer duplicates)
             row_type_value = ROW_TYPE_NEW
             appt = (appointment_number or "").strip()
             if "Sobeys" in name or (name and name.strip().lower().startswith("sobeys")):
                 count = _count_items_with_name_containing(token, bid, appt) if appt else 0
                 row_type_value = ROW_TYPE_NEW if count <= 1 else ROW_TYPE_UPDATE
             else:
-                count = loblaw_ref_counts.get(appt, 0)
-                row_type_value = ROW_TYPE_NEW if count <= 1 else ROW_TYPE_UPDATE
+                # Loblaw: only the OLDEST item (by creation) with this Reference # gets New; rest get Update
+                oldest_item_id = loblaw_oldest_item_id_per_ref.get(appt) if appt else None
+                if not appt:
+                    row_type_value = ROW_TYPE_NEW
+                elif oldest_item_id is None:
+                    row_type_value = ROW_TYPE_NEW  # ref # not seen in past 2 weeks → single occurrence
+                else:
+                    row_type_value = ROW_TYPE_NEW if oldest_item_id == iid else ROW_TYPE_UPDATE
+
+            shipment_ids: List[str] = []
+            load_ids: List[str] = []
+            po_details: List[Dict[str, str]] = []
+            altruos_api_debug: List[Dict[str, Any]] = []
+
+            if altruos_config and po_numbers:
+                for po in po_numbers:
+                    po_str = str(po).strip()
+                    shipment_id = _altruos_shipment_id_by_po(
+                        altruos_config, po_str, debug_list=altruos_api_debug
+                    )
+                    load_id: Optional[str] = None
+                    if shipment_id:
+                        shipment_ids.append(shipment_id)
+                        load_id = _altruos_load_id_by_shipment_id(
+                            altruos_config, shipment_id, debug_list=altruos_api_debug
+                        )
+                        if load_id:
+                            load_ids.append(load_id)
+                    po_details.append({
+                        "po": po_str,
+                        "shipment_id": shipment_id or "",
+                        "load_id": load_id or "",
+                    })
 
             extracted_row = {
                 "appointment_number": appointment_number,
@@ -960,10 +1343,12 @@ def extract_c3_appointment_details(
                 "appointment_date_time": appointment_date_time,
                 "c3_response": c3_response,
                 "po_numbers": po_numbers,
+                "shipment_ids": shipment_ids,
+                "load_ids": load_ids,
             }
 
             # Populate all columns on Monday: Appointment #, Client, Consignee, Appointment Date,
-            # Requested Delivery Appointment, PO, Row Type
+            # Requested Delivery Appointment, PO, Altruos Shipment ID, Altruos Load ID, Row Type
             try:
                 _update_item_with_extracted_columns(
                     token, bid, int(iid), column_by_title, extracted_row, row_type_value
@@ -971,7 +1356,7 @@ def extract_c3_appointment_details(
             except Exception as update_err:
                 row_type_value = f"{row_type_value} (update failed: {update_err})"
 
-            results.append({
+            result_item: Dict[str, Any] = {
                 "item_id": iid,
                 "appointment_number": appointment_number,
                 "client": client,
@@ -980,13 +1365,18 @@ def extract_c3_appointment_details(
                 "c3_response": c3_response,
                 "po_numbers": po_numbers,
                 "row_type": row_type_value,
-            })
+            }
+            if po_details:
+                result_item["po_details"] = po_details
+            if altruos_api_debug:
+                result_item["altruos_api_debug"] = altruos_api_debug
+            results.append(result_item)
 
-        # Save items to Downloads/new_records.txt and return path
+        # Save items to Downloads/new_records.csv (one row per PO, headers as column names)
         saved_path = ""
         if results:
             try:
-                saved_path = _save_items_to_downloads(results, NEW_RECORDS_FILENAME)
+                saved_path = _save_items_as_csv_to_downloads(results, NEW_RECORDS_FILENAME)
             except Exception as save_err:
                 saved_path = f"(save failed: {save_err})"
 
@@ -1044,6 +1434,7 @@ def main() -> None:
                 board_id=args.get("board_id"),
                 group_name=args.get("group_name"),
                 limit=int(args.get("limit") or DEV_LIMIT_ROWS),
+                config_path=args.get("config_path"),
             )
             print(json.dumps(result, indent=2))
         else:
