@@ -30,7 +30,9 @@
           "api_token": { "type": "string", "nullable": true },
           "board_id": { "type": "integer", "description": "Default 18392325187.", "nullable": true },
           "group_name": { "type": "string", "description": "Default C3 Inbox.", "nullable": true },
-          "limit": { "type": "integer", "description": "Max rows (Row Type empty). Default 5.", "nullable": true }
+          "limit": { "type": "integer", "description": "Max rows (Row Type empty). Default 5. Use smaller value when hosting to avoid timeouts.", "nullable": true },
+          "config_path": { "type": "string", "description": "Path to Altruos config JSON. Omit to skip Shipment/Load ID lookups and reduce runtime.", "nullable": true },
+          "skip_loblaw_past_weeks": { "type": "boolean", "description": "Skip Loblaw past-2-weeks scan; use batch order only. Reduces timeout risk when hosting.", "default": false }
         },
         "required": []
       }
