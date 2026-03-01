@@ -1,7 +1,7 @@
 {
   "slug": "monday-c3-po-extractor",
   "display_name": "Monday C3 PO Extractor",
-  "description": "Extracts PO numbers and full appointment details (appointment_number, client, consignee, appointment_date_time, c3_response, po_numbers) from Monday.com C3 board updates. Supports Sobeys and Loblaw email formats.",
+  "description": "Extracts PO numbers and full appointment details (appointment_number, client, consignee, appointment_date_time, c3_response, po_numbers) from Monday.com C3 board updates. Supports Sobeys and Loblaw email formats. Use start_extract_c3_appointment + check_job_status for long-running runs to avoid timeouts.",
   "version": "0.3.0",
   "entrypoint": {
     "type": "python",
@@ -14,25 +14,61 @@
       "schema": {
         "type": "object",
         "properties": {
-          "item_id": { "type": "integer", "description": "Single Monday.com item (pulse) ID." },
-          "item_ids": { "type": "array", "items": { "type": "integer" }, "description": "Multiple item IDs for batch results." },
+          "item_id": {
+            "type": "integer",
+            "description": "Single Monday.com item (pulse) ID."
+          },
+          "item_ids": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "description": "Multiple item IDs for batch results."
+          },
           "api_token": { "type": "string", "nullable": true }
         },
         "required": []
       }
     },
     {
-      "name": "extract_c3_appointment_details",
-      "description": "Fetches first N rows from C3 board where Row Type is empty; extracts appointment_number, client, consignee, appointment_date_time, c3_response, po_numbers from Sobeys or Loblaw emails.",
+      "name": "start_extract_c3_appointment",
+      "description": "RECOMMENDED for agentic platforms: Starts C3 appointment extraction in the background and returns immediately with a job_id. Does not require board_id or group_name (defaults are used). Poll check_job_status with the returned job_id every 10-30 seconds until status is completed or failed. Use this instead of extract_c3_appointment_details to avoid timeouts.",
       "schema": {
         "type": "object",
         "properties": {
           "api_token": { "type": "string", "nullable": true },
-          "board_id": { "type": "integer", "description": "Default 18392325187.", "nullable": true },
-          "group_name": { "type": "string", "description": "Default C3 Inbox.", "nullable": true },
-          "limit": { "type": "integer", "description": "Max rows (Row Type empty). Default 5. Use smaller value when hosting to avoid timeouts.", "nullable": true },
-          "config_path": { "type": "string", "description": "Path to Altruos config JSON. Omit to skip Shipment/Load ID lookups and reduce runtime.", "nullable": true },
-          "skip_loblaw_past_weeks": { "type": "boolean", "description": "Skip Loblaw past-2-weeks scan; use batch order only. Reduces timeout risk when hosting.", "default": false }
+          "board_id": { "type": "integer", "description": "Optional. Default 18392325187.", "nullable": true },
+          "group_name": { "type": "string", "description": "Optional. Default C3 Inbox.", "nullable": true },
+          "limit": { "type": "integer", "description": "Max rows to process. Default 5. Use 2 or 5 when hosting.", "nullable": true },
+          "config_path": { "type": "string", "description": "Path to Altruos config JSON. Omit to skip Shipment/Load ID lookups.", "nullable": true }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "check_job_status",
+      "description": "Check the status of a background extract job started with start_extract_c3_appointment. Returns status (pending/running/completed/failed), progress, and when completed the final_result (items, count, saved_path). Poll after calling start_extract_c3_appointment until status is completed or failed.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "description": "The job_id returned by start_extract_c3_appointment."
+          }
+        },
+        "required": ["job_id"]
+      }
+    },
+    {
+      "name": "extract_c3_appointment_details",
+      "description": "SYNCHRONOUS: Fetches first N rows from C3 board where Row Type is empty; extracts appointment_number, client, consignee, appointment_date_time, c3_response, po_numbers. board_id and group_name are optional (defaults used). May timeout on platforms; prefer start_extract_c3_appointment + check_job_status for long runs.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "api_token": { "type": "string", "nullable": true },
+          "board_id": { "type": "integer", "description": "Optional. Default 18392325187.", "nullable": true },
+          "group_name": { "type": "string", "description": "Optional. Default C3 Inbox.", "nullable": true },
+          "limit": { "type": "integer", "description": "Max rows. Default 5.", "nullable": true },
+          "config_path": { "type": "string", "description": "Path to Altruos config. Omit to skip Shipment/Load ID lookups.", "nullable": true },
+          "skip_loblaw_past_weeks": { "type": "boolean", "description": "Skip Loblaw past-2-weeks scan.", "default": false }
         },
         "required": []
       }
