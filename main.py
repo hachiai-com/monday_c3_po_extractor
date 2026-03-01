@@ -10,15 +10,22 @@ Monday C3 PO Extractor Toolkit.
   from Sobeys or Loblaw email format. When config_path is provided, also looks up Altruos Shipment ID
   (per PO via shipments/search) and Altruos Load ID (per Shipment ID via movements/search/shipments)
   and populates those Monday columns; the output CSV includes shipment_id and load_id per PO row.
+- start_extract_c3_appointment: Starts the same extraction in the background; returns job_id and
+  status "started" immediately so agentic platforms can avoid timeouts. Poll check_job_status with job_id.
+- check_job_status: Returns job status (started/running/completed/failed), progress, and when
+  completed the final_result (items, count, saved_path).
 """
 
 import csv
 import json
 import os
 import re
+import subprocess
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -49,7 +56,91 @@ CSV_HEADERS = [
 
 CAPABILITY_NAME = "extract_c3_po_numbers"
 CAPABILITY_APPOINTMENT = "extract_c3_appointment_details"
+CAPABILITY_START_APPOINTMENT = "start_extract_c3_appointment"
+CAPABILITY_CHECK_JOB = "check_job_status"
+CAPABILITY_RUN_BACKGROUND_JOB = "_run_background_extract_job"
 MONDAY_API_URL = "https://api.monday.com/v2"
+
+# =============================================================================
+# Job Management (file-based, same pattern as monday-toolkit)
+# =============================================================================
+
+
+class JobManager:
+    """Manages background extract job state using file-based storage (persists across process restarts)."""
+
+    STATUS_PENDING = "pending"
+    STATUS_RUNNING = "running"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+
+    def __init__(self, jobs_dir: Optional[str] = None) -> None:
+        if jobs_dir is None:
+            self.jobs_dir = Path(
+                os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))
+            ) / ".monday_c3_po_extractor_jobs"
+        else:
+            self.jobs_dir = Path(jobs_dir)
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+
+    def _get_job_file(self, job_id: str) -> Path:
+        return self.jobs_dir / f"{job_id}.json"
+
+    def create_job(self, job_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new job entry."""
+        job_data = {
+            "job_id": job_id,
+            "status": self.STATUS_PENDING,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "args": args,
+            "progress": {"items_total": 0, "items_processed": 0},
+            "result": None,
+            "error": None,
+        }
+        self._save_job(job_id, job_data)
+        return job_data
+
+    def update_job_status(
+        self,
+        job_id: str,
+        status: str,
+        progress: Optional[Dict[str, Any]] = None,
+        result: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Update job status and optionally progress, result, or error."""
+        job_data = self.get_job(job_id)
+        if job_data:
+            job_data["status"] = status
+            job_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+            if progress is not None:
+                job_data["progress"].update(progress)
+            if result is not None:
+                job_data["result"] = result
+            if error is not None:
+                job_data["error"] = error
+            self._save_job(job_id, job_data)
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Get job data by ID."""
+        job_file = self._get_job_file(job_id)
+        if job_file.exists():
+            try:
+                with open(job_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return None
+        return None
+
+    def _save_job(self, job_id: str, job_data: Dict[str, Any]) -> None:
+        """Save job data to file."""
+        job_file = self._get_job_file(job_id)
+        with open(job_file, "w", encoding="utf-8") as f:
+            json.dump(job_data, f, indent=2)
+
+
+_job_manager = JobManager()
 
 # C3 board and group (BOT: C3 Appointment Management)
 DEFAULT_BOARD_ID = 18392325187
@@ -1153,6 +1244,7 @@ def extract_c3_appointment_details(
     group_name: Optional[str] = None,
     limit: int = DEV_LIMIT_ROWS,
     config_path: Optional[str] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
     Fetches items from the C3 board where Row Type is empty (first N rows in dev),
@@ -1160,6 +1252,7 @@ def extract_c3_appointment_details(
     po_numbers. When config_path is provided, also looks up Altruos Shipment ID and Load ID
     via API (PO -> shipments/search, Shipment ID -> movements/search/shipments).
     Supports Sobeys and Loblaw email formats.
+    If progress_callback is provided, it is called with {"items_total": n, "items_processed": i}.
     """
     try:
         token = _get_api_token(api_token)
@@ -1219,6 +1312,10 @@ def extract_c3_appointment_details(
                 },
                 "capability": CAPABILITY_APPOINTMENT,
             }
+
+        items_total = len(items_to_process)
+        if progress_callback:
+            progress_callback({"items_total": items_total, "items_processed": 0})
 
         item_ids = [str(i["id"]) for i in items_to_process]
         updates_by_item = {}
@@ -1371,6 +1468,8 @@ def extract_c3_appointment_details(
             if altruos_api_debug:
                 result_item["altruos_api_debug"] = altruos_api_debug
             results.append(result_item)
+            if progress_callback:
+                progress_callback({"items_total": items_total, "items_processed": len(results)})
 
         # Save items to Downloads/new_records.csv (one row per PO, headers as column names)
         saved_path = ""
@@ -1392,6 +1491,151 @@ def extract_c3_appointment_details(
         return {
             "error": str(e),
             "capability": CAPABILITY_APPOINTMENT,
+        }
+
+
+def _run_background_extract_job(args: Dict[str, Any]) -> None:
+    """
+    Internal capability: runs in a background subprocess. Updates job status via JobManager
+    (file-based) as it progresses. Called with capability _run_background_extract_job.
+    """
+    job_id = args.get("job_id")
+    original_args = args.get("original_args", {})
+    if not job_id:
+        return
+    try:
+        _job_manager.update_job_status(job_id, JobManager.STATUS_RUNNING)
+
+        def progress_cb(progress: Dict[str, Any]) -> None:
+            _job_manager.update_job_status(job_id, JobManager.STATUS_RUNNING, progress=progress)
+
+        result = extract_c3_appointment_details(
+            api_token=original_args.get("api_token"),
+            board_id=original_args.get("board_id"),
+            group_name=original_args.get("group_name"),
+            limit=int(original_args.get("limit") or DEV_LIMIT_ROWS),
+            config_path=original_args.get("config_path"),
+            progress_callback=progress_cb,
+        )
+        if "error" in result:
+            _job_manager.update_job_status(
+                job_id, JobManager.STATUS_FAILED, error=result["error"]
+            )
+        else:
+            _job_manager.update_job_status(
+                job_id,
+                JobManager.STATUS_COMPLETED,
+                result=result.get("result"),
+                progress={
+                    "items_total": result.get("result", {}).get("count", 0),
+                    "items_processed": result.get("result", {}).get("count", 0),
+                },
+            )
+    except Exception as e:
+        _job_manager.update_job_status(
+            job_id, JobManager.STATUS_FAILED, error=str(e)
+        )
+
+
+def start_extract_c3_appointment(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Starts C3 appointment extraction in a background subprocess and returns immediately with job_id.
+    Use check_job_status with job_id to poll for completion (e.g. every 10–30 seconds).
+    """
+    try:
+        if not args.get("api_token"):
+            return {
+                "error": "Missing required parameter: api_token",
+                "capability": CAPABILITY_START_APPOINTMENT,
+            }
+        job_id = str(uuid.uuid4())[:8]
+        _job_manager.create_job(job_id, args)
+
+        script_path = os.path.abspath(__file__)
+        background_input = json.dumps({
+            "capability": CAPABILITY_RUN_BACKGROUND_JOB,
+            "args": {"job_id": job_id, "original_args": args},
+        })
+
+        if sys.platform == "win32":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            process = subprocess.Popen(
+                [sys.executable, script_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                close_fds=True,
+            )
+            process.stdin.write(background_input.encode())
+            process.stdin.close()
+        else:
+            process = subprocess.Popen(
+                [sys.executable, script_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            process.stdin.write(background_input.encode())
+            process.stdin.close()
+
+        return {
+            "result": {
+                "job_id": job_id,
+                "status": "started",
+                "message": "Extract job started in background. Use check_job_status to monitor progress.",
+            },
+            "capability": CAPABILITY_START_APPOINTMENT,
+        }
+    except Exception as e:
+        return {
+            "error": f"Failed to start job: {str(e)}",
+            "capability": CAPABILITY_START_APPOINTMENT,
+        }
+
+
+def check_job_status(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Check the status of a background extract job. Returns progress and, when completed, final_result.
+    Poll every 10–30 seconds until status is "completed" or "failed".
+    """
+    try:
+        job_id = args.get("job_id")
+        if not job_id:
+            return {
+                "error": "Missing required parameter: job_id",
+                "capability": CAPABILITY_CHECK_JOB,
+            }
+        job_id = str(job_id).strip()
+        job_data = _job_manager.get_job(job_id)
+        if job_data is None:
+            return {
+                "error": f"Job not found: {job_id}",
+                "capability": CAPABILITY_CHECK_JOB,
+            }
+        response = {
+            "result": {
+                "job_id": job_id,
+                "status": job_data["status"],
+                "created_at": job_data["created_at"],
+                "updated_at": job_data["updated_at"],
+                "progress": job_data.get("progress") or {"items_total": 0, "items_processed": 0},
+            },
+            "capability": CAPABILITY_CHECK_JOB,
+        }
+        if job_data["status"] == JobManager.STATUS_COMPLETED and job_data.get("result"):
+            response["result"]["final_result"] = job_data["result"]
+        if job_data["status"] == JobManager.STATUS_FAILED and job_data.get("error"):
+            response["result"]["error"] = job_data["error"]
+        return response
+    except Exception as e:
+        return {
+            "error": f"Error checking job status: {str(e)}",
+            "capability": CAPABILITY_CHECK_JOB,
         }
 
 
@@ -1437,6 +1681,14 @@ def main() -> None:
                 config_path=args.get("config_path"),
             )
             print(json.dumps(result, indent=2))
+        elif capability == CAPABILITY_START_APPOINTMENT:
+            result = start_extract_c3_appointment(args)
+            print(json.dumps(result, indent=2))
+        elif capability == CAPABILITY_CHECK_JOB:
+            result = check_job_status(args)
+            print(json.dumps(result, indent=2))
+        elif capability == CAPABILITY_RUN_BACKGROUND_JOB:
+            _run_background_extract_job(args)
         else:
             print(
                 json.dumps(
