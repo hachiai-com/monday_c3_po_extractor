@@ -465,7 +465,7 @@ def _altruos_load_id_by_shipment_id(
             )
         except Exception:
             return None
-    # Use only "load_id" label from response (result_list[].movement.header.load_id); if not found leave blank
+    # Use only "load_id" label from response (result_list[].movement.header.load_id); if not found caller uses "unknown" for Monday
     if isinstance(data, list) and len(data) > 0:
         first = data[0]
         lid = _extract_load_id_from_movement_item(first)
@@ -1427,10 +1427,12 @@ def extract_c3_appointment_details(
                         )
                         if load_id:
                             load_ids.append(load_id)
+                        else:
+                            load_ids.append("unknown")
                     po_details.append({
                         "po": po_str,
                         "shipment_id": shipment_id or "",
-                        "load_id": load_id or "",
+                        "load_id": (load_id or "unknown") if shipment_id else (load_id or ""),
                     })
 
             extracted_row = {
