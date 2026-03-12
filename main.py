@@ -470,12 +470,34 @@ def _altruos_load_id_by_shipment_id(
         first = data[0]
         lid = _extract_load_id_from_movement_item(first)
         return str(lid) if lid is not None else None
+    
     if isinstance(data, dict):
         result_list = data.get("result_list") or []
+        matching_movement_count = data.get("matching_movement_count", 0)
+        
         if result_list and isinstance(result_list, list):
-            first = result_list[0]
-            lid = _extract_load_id_from_movement_item(first)
-            return str(lid) if lid is not None else None
+            # If only one match, return the first item's load_id
+            if matching_movement_count == 1:
+                first = result_list[0]
+                lid = _extract_load_id_from_movement_item(first)
+                return str(lid) if lid is not None else None
+            
+            # If multiple matches, find the one with movement_type DELIVERY or DIRECT_DELIVERY
+            if matching_movement_count > 1:
+                for item in result_list:
+                    if not isinstance(item, dict):
+                        continue
+                    movement = item.get("movement")
+                    if not isinstance(movement, dict):
+                        continue
+                    header = movement.get("header")
+                    if not isinstance(header, dict):
+                        continue
+                    movement_type = header.get("movement_type")
+                    if movement_type in ("DELIVERY", "DIRECT_DELIVERY"):
+                        load_id = header.get("load_id")
+                        return str(load_id) if load_id is not None else None
+    
     return None
 
 
