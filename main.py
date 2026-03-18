@@ -166,6 +166,14 @@ COL_PO = "PO"
 COL_C3_RESPONSE = "C3 Response"
 COL_ALTRUOS_SHIPMENT_ID = "Altruos Shipment ID"
 COL_ALTRUOS_LOAD_ID = "Altruos Load ID"
+COL_STATUS = "Status"
+COL_ACTION_REQUIRED = "Action Required"
+COL_TECHNICAL_RESPONSE = "Technical response"
+
+# When no POs extracted from email body:
+STATUS_FAILED = "Failed"
+ACTION_MANUAL_REVIEW_REQUIRED = "Manual Review Required"
+TECHNICAL_RESPONSE_NO_PO = "Failed to read po from email body"
 
 # C3 Response: raw label from email -> Monday column label (status)
 # Standard subject lines (dates/times/numbers vary); match is case-insensitive and allows suffixes like "(POs Added/Removed)", "[Scheduled Date/Time...]", " notification".
@@ -1111,6 +1119,19 @@ def _update_item_with_extracted_columns(
             break
     if row_type_cid:
         payload[row_type_cid] = {"label": row_type_value}
+
+    # When no POs extracted: set Status=Failed, Action Required=Manual Review Required, Technical response message
+    po_numbers = extracted.get("po_numbers") or []
+    if not po_numbers:
+        status_cid = (column_by_title.get(COL_STATUS.lower()) or {}).get("id")
+        if status_cid:
+            payload[status_cid] = {"label": STATUS_FAILED}
+        action_cid = (column_by_title.get(COL_ACTION_REQUIRED.lower()) or {}).get("id")
+        if action_cid:
+            payload[action_cid] = {"label": ACTION_MANUAL_REVIEW_REQUIRED}
+        tech_cid = (column_by_title.get(COL_TECHNICAL_RESPONSE.lower()) or {}).get("id")
+        if tech_cid:
+            payload[tech_cid] = TECHNICAL_RESPONSE_NO_PO
 
     if not payload:
         return
