@@ -5,7 +5,7 @@ Monday C3 PO Extractor Toolkit.
 
 - extract_c3_po_numbers: Given item_id(s), extracts PO numbers from the "Purchase Order Number"
   column in update body tables.
-- extract_c3_appointment_details: Fetches first N rows from the C3 board where Row Type is empty,
+- extract_c3_appointment_details: Fetches items from the C3 board where Row Type is empty, picks latest by Creation log, then first N,
   and extracts appointment number, Client, Consignee, Appointment Date and time, C3 Response, POs
   from Sobeys or Loblaw email format. When config_path is provided, also looks up Altruos Shipment ID
   (per PO via shipments/search) and Altruos Load ID (per Shipment ID via movements/search/shipments)
@@ -146,6 +146,10 @@ _job_manager = JobManager()
 DEFAULT_BOARD_ID = 18392325187
 DEFAULT_GROUP_NAME = "C3 Inbox"
 ROW_TYPE_COLUMN_TITLE = "Row Type"
+CREATION_LOG_COLUMN_TITLE = "Creation log"
+# Test filter: when use_test_filter=True, run only on rows with this label in "Dropdown" column
+DROPDOWN_COLUMN_TITLE = "Dropdown"
+TEST_READY_LABEL = "test ready"
 DEV_LIMIT_ROWS = 2
 # Loblaw "past 2 weeks" filter: column for date (board-specific)
 LOBLAW_DATE_COLUMN_ID = "pulse_log_mkypz8ad"
@@ -799,6 +803,22 @@ def _fetch_board_columns(api_token: str, board_id: int) -> List[Dict[str, Any]]:
     return boards[0].get("columns") or []
 
 
+def _fetch_board_groups(api_token: str, board_id: int) -> List[Dict[str, Any]]:
+    """Fetch board groups (id, title) to resolve group id by title."""
+    query = """
+    query BoardGroups($boardIds: [ID!]!) {
+      boards(ids: $boardIds) {
+        groups { id title }
+      }
+    }
+    """
+    result = _monday_graphql(api_token, query, {"boardIds": [board_id]})
+    boards = result.get("data", {}).get("boards") or []
+    if not boards:
+        return []
+    return boards[0].get("groups") or []
+
+
 def _column_ids_by_title(columns: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """Build map: column title (normalized lower) -> {id, type} for lookup."""
     by_title: Dict[str, Dict[str, Any]] = {}
@@ -836,8 +856,11 @@ def _fetch_items_page(
     limit: int = 100,
     cursor: Optional[str] = None,
     include_column_values: bool = True,
+    query_params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Fetch one page of items from board with name, group, and optionally column_values."""
+    """Fetch one page of items from board with name, group, and optionally column_values.
+    When query_params is set (e.g. order_by Creation log descending), the first request uses it;
+    pagination via cursor preserves the same order."""
     item_fields = "id name group { id title }"
     if include_column_values:
         item_fields += " column_values { id text }"
@@ -853,17 +876,34 @@ def _fetch_items_page(
         result = _monday_graphql(api_token, query, {"cursor": cursor})
         page = result.get("data", {}).get("next_items_page") or {}
     else:
-        query = f"""
-        query BoardItems($boardIds: [ID!]!, $limit: Int!) {{
-          boards(ids: $boardIds) {{
-            items_page(limit: $limit) {{
-              cursor
-              items {{ {item_fields} }}
+        if query_params:
+            query = f"""
+            query BoardItems($boardIds: [ID!]!, $limit: Int!, $queryParams: ItemsQuery) {{
+              boards(ids: $boardIds) {{
+                items_page(limit: $limit, query_params: $queryParams) {{
+                  cursor
+                  items {{ {item_fields} }}
+                }}
+              }}
             }}
-          }}
-        }}
-        """
-        result = _monday_graphql(api_token, query, {"boardIds": [board_id], "limit": min(limit, 500)})
+            """
+            result = _monday_graphql(
+                api_token,
+                query,
+                {"boardIds": [board_id], "limit": min(limit, 500), "queryParams": query_params},
+            )
+        else:
+            query = f"""
+            query BoardItems($boardIds: [ID!]!, $limit: Int!) {{
+              boards(ids: $boardIds) {{
+                items_page(limit: $limit) {{
+                  cursor
+                  items {{ {item_fields} }}
+                }}
+              }}
+            }}
+            """
+            result = _monday_graphql(api_token, query, {"boardIds": [board_id], "limit": min(limit, 500)})
         boards = result.get("data", {}).get("boards") or []
         page = (boards[0].get("items_page") or {}) if boards else {}
     items = page.get("items") or []
@@ -882,11 +922,32 @@ def _get_column_value_text(item: Dict[str, Any], column_title: str) -> Optional[
 def _get_column_value_text_by_id(
     column_values: List[Dict[str, Any]], column_id: str
 ) -> Optional[str]:
-    """Get column value text by column id (Monday API returns id, text only on ColumnValue)."""
+    """Get column value text by column id. For status columns, check 'label', 'text', and raw
+    'value' JSON so we reliably detect when Row Type is set (and exclude from next run)."""
     for cv in column_values or []:
-        if (cv.get("id") or "").strip().lower() == column_id.strip().lower():
-            t = (cv.get("text") or "").strip()
-            return t if t else None
+        if (cv.get("id") or "").strip().lower() != column_id.strip().lower():
+            continue
+        # Status columns: prefer label, then text
+        label = (cv.get("label") or "").strip()
+        if label:
+            return label
+        t = (cv.get("text") or "").strip()
+        if t:
+            return t
+        # Fallback: parse raw value JSON (e.g. {"label":"New","index":0})
+        raw = cv.get("value")
+        if raw is not None and isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    v = parsed.get("label") or parsed.get("labels")
+                    if isinstance(v, list) and v:
+                        return str(v[0]).strip() or None
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return None
     return None
 
 
@@ -894,7 +955,8 @@ def _fetch_column_values_for_items(
     api_token: str,
     item_ids: List[str],
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """Fetch column_values for given item IDs. Returns item_id -> list of column_values."""
+    """Fetch column_values for given item IDs. Returns item_id -> list of column_values.
+    Includes CreationLogValue.created_at when available (for sorting by Creation log)."""
     if not item_ids:
         return {}
     ids_arg = json.dumps([int(i) for i in item_ids])
@@ -902,13 +964,33 @@ def _fetch_column_values_for_items(
     query {{
       items(ids: {ids_arg}) {{
         id
-        column_values {{ id text }}
+        column_values {{ id text value ... on CreationLogValue {{ created_at }} ... on StatusValue {{ label }} }}
       }}
     }}
     """
     result = _monday_graphql(api_token, query)
     items = result.get("data", {}).get("items") or []
     return {str(i["id"]): (i.get("column_values") or []) for i in items}
+
+
+def _get_creation_log_sort_key(
+    column_values: List[Dict[str, Any]],
+    creation_log_column_id: Optional[str],
+) -> str:
+    """Return a sort key from Creation log column (newest = larger string). Empty string = oldest."""
+    if not creation_log_column_id or not column_values:
+        return ""
+    for cv in column_values:
+        if (cv.get("id") or "").strip().lower() != creation_log_column_id.strip().lower():
+            continue
+        created_at = cv.get("created_at")
+        if created_at:
+            return (created_at or "").strip()
+        text = (cv.get("text") or "").strip()
+        if text:
+            return text
+        return ""
+    return ""
 
 
 def _fetch_updates_for_items(
@@ -1083,7 +1165,7 @@ def _fetch_loblaw_items_past_weeks(
     """
     try:
         query = """
-        query LoblawItems($boardIds: [ID!]!, $limit: Int!, $queryParams: QueryParamsInput) {
+        query LoblawItems($boardIds: [ID!]!, $limit: Int!, $queryParams: ItemsQuery) {
           boards(ids: $boardIds) {
             items_page(limit: $limit, query_params: $queryParams) {
               cursor
@@ -1267,10 +1349,14 @@ def extract_c3_appointment_details(
     limit: int = DEV_LIMIT_ROWS,
     config_path: Optional[str] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    use_test_filter: bool = False,
 ) -> Dict[str, Any]:
     """
-    Fetches items from the C3 board where Row Type is empty (first N rows in dev),
-    and extracts appointment_number, client, consignee, appointment_date_time, c3_response,
+    Fetches items from the C3 board where Row Type is empty, then keeps only the latest
+    rows by sorting by the "Creation log" column (newest first) and taking the first N.
+    When use_test_filter=True (testing only), fetches items where "Dropdown" column has
+    label "test ready" instead of Row Type empty.
+    Extracts appointment_number, client, consignee, appointment_date_time, c3_response,
     po_numbers. When config_path is provided, also looks up Altruos Shipment ID and Load ID
     via API (PO -> shipments/search, Shipment ID -> movements/search/shipments).
     Supports Sobeys and Loblaw email formats.
@@ -1283,53 +1369,122 @@ def extract_c3_appointment_details(
         max_items = max(1, min(limit, 50))
         altruos_config = _load_altruos_config(config_path)
 
-        # Resolve column ids from board (for Row Type filter and for populating extracted values)
+        # Resolve column ids and group id from board
         columns = _fetch_board_columns(token, bid)
         row_type_column_id: Optional[str] = None
+        dropdown_column_id: Optional[str] = None
         for col in columns:
-            if (col.get("title") or "").strip().lower() == ROW_TYPE_COLUMN_TITLE.lower():
+            title_lower = (col.get("title") or "").strip().lower()
+            if title_lower == ROW_TYPE_COLUMN_TITLE.lower():
                 row_type_column_id = (col.get("id") or "").strip()
-                break
+            elif title_lower == DROPDOWN_COLUMN_TITLE.lower():
+                dropdown_column_id = (col.get("id") or "").strip()
         column_by_title = _column_ids_by_title(columns)
 
-        # Fetch items from board (id, name, group only); then fetch column_values to filter Row Type empty
-        group_candidates: List[Dict[str, Any]] = []
-        cursor = None
-        while len(group_candidates) < max(max_items, 50):
-            items_page, cursor = _fetch_items_page(
-                token, bid, limit=100, cursor=cursor, include_column_values=False
+        groups = _fetch_board_groups(token, bid)
+        group_id: Optional[str] = None
+        for g in groups:
+            if (g.get("title") or "").strip() == group_filter:
+                group_id = (g.get("id") or "").strip()
+                break
+
+        items_to_process: List[Dict[str, Any]] = []
+
+        # Test filter: only rows where Dropdown column has label "test ready" (newest first).
+        if use_test_filter and dropdown_column_id and group_id:
+            pool_size = max(max_items, 100)
+            test_ready_params = {
+                "rules": [
+                    {"column_id": "group", "compare_value": [group_id], "operator": "any_of"},
+                    {
+                        "column_id": dropdown_column_id,
+                        "compare_value": [TEST_READY_LABEL],
+                        "operator": "contains_terms",
+                    },
+                ],
+                "operator": "and",
+                "order_by": [{"column_id": "__creation_log__", "direction": "desc"}],
+            }
+            page, _ = _fetch_items_page(
+                token,
+                bid,
+                limit=min(pool_size, 500),
+                cursor=None,
+                include_column_values=False,
+                query_params=test_ready_params,
             )
-            for item in items_page:
-                g = item.get("group") or {}
-                if (g.get("title") or "").strip() != group_filter:
+            items_to_process = page[:max_items]
+        # Production: only items with empty Row Type in our group (newest first).
+        elif not use_test_filter and row_type_column_id and group_id:
+            pool_size = max(max_items, 100)
+            empty_row_type_params = {
+                "rules": [
+                    {"column_id": row_type_column_id, "operator": "is_empty", "compare_value": []},
+                    {"column_id": "group", "compare_value": [group_id], "operator": "any_of"},
+                ],
+                "operator": "and",
+                "order_by": [{"column_id": "__creation_log__", "direction": "desc"}],
+            }
+            page, _ = _fetch_items_page(
+                token,
+                bid,
+                limit=min(pool_size, 500),
+                cursor=None,
+                include_column_values=False,
+                query_params=empty_row_type_params,
+            )
+            items_to_process = page[:max_items]
+        elif not use_test_filter:
+            # Fallback: fetch by Creation log desc then filter by group and empty Row Type in code
+            creation_log_desc_params = {
+                "order_by": [{"column_id": "__creation_log__", "direction": "desc"}]
+            }
+            group_candidates = []
+            cursor = None
+            pool_size = max(max_items, 100)
+            while len(group_candidates) < pool_size:
+                items_page, cursor = _fetch_items_page(
+                    token,
+                    bid,
+                    limit=100,
+                    cursor=cursor,
+                    include_column_values=False,
+                    query_params=creation_log_desc_params if cursor is None else None,
+                )
+                for item in items_page:
+                    g = item.get("group") or {}
+                    if (g.get("title") or "").strip() != group_filter:
+                        continue
+                    group_candidates.append(item)
+                if not cursor or not items_page:
+                    break
+            cv_by_id = {}
+            for i in range(0, len(group_candidates), 50):
+                batch_ids = [str(it["id"]) for it in group_candidates[i : i + 50]]
+                cv_by_id.update(_fetch_column_values_for_items(token, batch_ids))
+            for item in group_candidates:
+                iid = str(item.get("id", ""))
+                cvs = cv_by_id.get(iid) or []
+                if row_type_column_id:
+                    row_type_text = _get_column_value_text_by_id(cvs, row_type_column_id)
+                else:
+                    row_type_text = None
+                if row_type_text is not None and str(row_type_text).strip() != "":
                     continue
-                group_candidates.append(item)
-            if not cursor or not items_page:
-                break
-
-        # Batch fetch column_values for candidates (id, text only), then filter Row Type empty
-        candidate_ids = [str(i["id"]) for i in group_candidates[:50]]
-        cv_by_id = _fetch_column_values_for_items(token, candidate_ids)
-        all_candidates: List[Dict[str, Any]] = []
-        for item in group_candidates:
-            iid = str(item.get("id", ""))
-            cvs = cv_by_id.get(iid) or []
-            if row_type_column_id:
-                row_type_text = _get_column_value_text_by_id(cvs, row_type_column_id)
-            else:
-                row_type_text = None
-            if row_type_text is not None and str(row_type_text).strip() != "":
-                continue
-            all_candidates.append(item)
-            if len(all_candidates) >= max_items:
-                break
-
-        items_to_process = all_candidates[:max_items]
+                items_to_process.append(item)
+                if len(items_to_process) >= max_items:
+                    break
+            items_to_process = items_to_process[:max_items]
         if not items_to_process:
+            msg = (
+                f'No items found with "{DROPDOWN_COLUMN_TITLE}" = "{TEST_READY_LABEL}" in group.'
+                if use_test_filter
+                else "No items found with Row Type empty in group."
+            )
             return {
                 "result": {
                     "items": [],
-                    "message": "No items found with Row Type empty in group.",
+                    "message": msg,
                     "saved_path": "",
                 },
                 "capability": CAPABILITY_APPOINTMENT,
@@ -1451,11 +1606,18 @@ def extract_c3_appointment_details(
                             load_ids.append(load_id)
                         else:
                             load_ids.append("unknown")
+                    else:
+                        # PO → Shipment lookup returned empty; populate as "unknown"
+                        shipment_ids.append("unknown")
+                        load_ids.append("unknown")
                     po_details.append({
                         "po": po_str,
-                        "shipment_id": shipment_id or "",
-                        "load_id": (load_id or "unknown") if shipment_id else (load_id or ""),
+                        "shipment_id": shipment_id or "unknown",
+                        "load_id": (load_id or "unknown") if shipment_id else "unknown",
                     })
+                # Deduplicate for Monday board (preserve order): only unique shipment_ids and load_ids
+                shipment_ids = list(dict.fromkeys(shipment_ids))
+                load_ids = list(dict.fromkeys(load_ids))
 
             extracted_row = {
                 "appointment_number": appointment_number,
@@ -1540,6 +1702,7 @@ def _run_background_extract_job(args: Dict[str, Any]) -> None:
             limit=int(original_args.get("limit") or DEV_LIMIT_ROWS),
             config_path=original_args.get("config_path"),
             progress_callback=progress_cb,
+            use_test_filter=bool(original_args.get("use_test_filter")),
         )
         if "error" in result:
             _job_manager.update_job_status(
@@ -1703,6 +1866,7 @@ def main() -> None:
                 group_name=args.get("group_name"),
                 limit=int(args.get("limit") or DEV_LIMIT_ROWS),
                 config_path=args.get("config_path"),
+                use_test_filter=bool(args.get("use_test_filter")),
             )
             print(json.dumps(result, indent=2))
         elif capability == CAPABILITY_START_APPOINTMENT:
