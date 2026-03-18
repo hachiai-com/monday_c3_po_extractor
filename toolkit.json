@@ -38,7 +38,8 @@
           "board_id": { "type": "integer", "description": "Optional. Default 18392325187.", "nullable": true },
           "group_name": { "type": "string", "description": "Optional. Default C3 Inbox.", "nullable": true },
           "limit": { "type": "integer", "description": "Max rows to process. Default 5. Use 2 or 5 when hosting.", "nullable": true },
-          "config_path": { "type": "string", "description": "Path to Altruos config JSON. Omit to skip Shipment/Load ID lookups.", "nullable": true }
+          "config_path": { "type": "string", "description": "Path to Altruos config JSON. Omit to skip Shipment/Load ID lookups.", "nullable": true },
+          "use_test_filter": { "type": "boolean", "description": "If true, process only rows where Dropdown = 'test ready' (testing only).", "default": false }
         },
         "required": []
       }
@@ -59,7 +60,7 @@
     },
     {
       "name": "extract_c3_appointment_details",
-      "description": "SYNCHRONOUS: Fetches first N rows from C3 board where Row Type is empty; extracts appointment_number, client, consignee, appointment_date_time, c3_response, po_numbers. board_id and group_name are optional (defaults used). May timeout on platforms; prefer start_extract_c3_appointment + check_job_status for long runs.",
+      "description": "SYNCHRONOUS: Fetches first N rows from C3 board where Row Type is empty; extracts appointment_number, client, consignee, appointment_date_time, c3_response, po_numbers. board_id and group_name are optional (defaults used). When use_test_filter is true, runs only on rows where Dropdown column has label 'test ready' (for testing). May timeout on platforms; prefer start_extract_c3_appointment + check_job_status for long runs.",
       "schema": {
         "type": "object",
         "properties": {
@@ -68,7 +69,8 @@
           "group_name": { "type": "string", "description": "Optional. Default C3 Inbox.", "nullable": true },
           "limit": { "type": "integer", "description": "Max rows. Default 5.", "nullable": true },
           "config_path": { "type": "string", "description": "Path to Altruos config. Omit to skip Shipment/Load ID lookups.", "nullable": true },
-          "skip_loblaw_past_weeks": { "type": "boolean", "description": "Skip Loblaw past-2-weeks scan.", "default": false }
+          "skip_loblaw_past_weeks": { "type": "boolean", "description": "Skip Loblaw past-2-weeks scan.", "default": false },
+          "use_test_filter": { "type": "boolean", "description": "If true, process only rows where Dropdown column = 'test ready' (testing only).", "default": false }
         },
         "required": []
       }
