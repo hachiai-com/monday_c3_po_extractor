@@ -149,7 +149,7 @@ ROW_TYPE_COLUMN_TITLE = "Row Type"
 CREATION_LOG_COLUMN_TITLE = "Creation log"
 # Test filter: when use_test_filter=True, run only on rows with this label in "Dropdown" column
 DROPDOWN_COLUMN_TITLE = "Dropdown"
-TEST_READY_LABEL = "test ready"
+TEST_READY_LABEL = "test 2"
 DEV_LIMIT_ROWS = 2
 # Loblaw "past 2 weeks" filter: column for date (board-specific)
 LOBLAW_DATE_COLUMN_ID = "pulse_log_mkypz8ad"
@@ -1610,13 +1610,24 @@ def extract_c3_appointment_details(
             load_ids: List[str] = []
             po_details: List[Dict[str, str]] = []
             altruos_api_debug: List[Dict[str, Any]] = []
+            po_numbers_for_output: List[str] = list(po_numbers or [])
 
             if altruos_config and po_numbers:
                 for po in po_numbers:
                     po_str = str(po).strip()
+                    po_used = po_str
                     shipment_id = _altruos_shipment_id_by_po(
                         altruos_config, po_str, debug_list=altruos_api_debug
                     )
+                    # Fallback lookup: if PO with leading zeros has no shipment, retry without leading zeros.
+                    if not shipment_id:
+                        po_no_leading_zero = po_str.lstrip("0") or "0"
+                        if po_no_leading_zero != po_str:
+                            shipment_id = _altruos_shipment_id_by_po(
+                                altruos_config, po_no_leading_zero, debug_list=altruos_api_debug
+                            )
+                            if shipment_id:
+                                po_used = po_no_leading_zero
                     load_id: Optional[str] = None
                     if shipment_id:
                         shipment_ids.append(shipment_id)
@@ -1632,13 +1643,14 @@ def extract_c3_appointment_details(
                         shipment_ids.append("unknown")
                         load_ids.append("unknown")
                     po_details.append({
-                        "po": po_str,
+                        "po": po_used,
                         "shipment_id": shipment_id or "unknown",
                         "load_id": (load_id or "unknown") if shipment_id else "unknown",
                     })
                 # Deduplicate for Monday board (preserve order): only unique shipment_ids and load_ids
                 shipment_ids = list(dict.fromkeys(shipment_ids))
                 load_ids = list(dict.fromkeys(load_ids))
+                po_numbers_for_output = [d.get("po", "") for d in po_details if d.get("po")]
 
             extracted_row = {
                 "appointment_number": appointment_number,
@@ -1646,7 +1658,7 @@ def extract_c3_appointment_details(
                 "consignee": consignee,
                 "appointment_date_time": appointment_date_time,
                 "c3_response": c3_response,
-                "po_numbers": po_numbers,
+                "po_numbers": po_numbers_for_output,
                 "shipment_ids": shipment_ids,
                 "load_ids": load_ids,
             }
@@ -1667,7 +1679,7 @@ def extract_c3_appointment_details(
                 "consignee": consignee,
                 "appointment_date_time": appointment_date_time,
                 "c3_response": c3_response,
-                "po_numbers": po_numbers,
+                "po_numbers": po_numbers_for_output,
                 "row_type": row_type_value,
             }
             if po_details:
