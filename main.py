@@ -9,7 +9,7 @@ Monday C3 PO Extractor Toolkit.
   and extracts appointment number, Client, Consignee, Appointment Date and time, C3 Response, POs
   from Sobeys or Loblaw email format. When config_path is provided, also looks up Altruos Shipment ID
   (per PO via shipments/search) and Altruos Load ID (per Shipment ID via movements/search/shipments)
-  and populates those Monday columns; the output CSV includes shipment_id and load_id per PO row.
+  and populates those Monday columns; the output CSV includes shipment_id, load_id, and Technical response per PO row.
 - start_extract_c3_appointment: Starts the same extraction in the background; returns job_id and
   status "started" immediately so agentic platforms can avoid timeouts. Poll check_job_status with job_id.
 - check_job_status: Returns job status (started/running/completed/failed), progress, and when
@@ -51,6 +51,7 @@ CSV_HEADERS = [
     "shipment_id",
     "load_id",
     "row_type",
+    "Technical response",
 ]
 
 
@@ -174,6 +175,40 @@ COL_TECHNICAL_RESPONSE = "Technical response"
 STATUS_FAILED = "Failed"
 ACTION_MANUAL_REVIEW_REQUIRED = "Manual Review Required"
 TECHNICAL_RESPONSE_NO_PO = "Failed to read po from email body"
+TECHNICAL_RESPONSE_UNEXPECTED_SUBJECT = "Unexpected Email Subject"
+TECHNICAL_RESPONSE_COULD_NOT_RESOLVE_CLIENT = (
+    "Could not resolve client - Unexpected Email Subject"
+)
+TECHNICAL_RESPONSE_COULD_NOT_RESOLVE_C3 = (
+    "could not resolve C3 response - Unexpected Email Subject"
+)
+
+# Client column must be one of these (case-insensitive); "LBL" is stored as "Loblaw"
+ALLOWED_CLIENT_CANONICAL = frozenset({"loblaw", "sobeys"})
+
+# Monday C3 Response status labels we accept after mapping raw email text
+ALLOWED_C3_RESPONSE_LABELS_NORMALIZED = frozenset(
+    {
+        "approved",
+        "update",
+        "no show",
+        "missing/incorrect paperwork",
+        "signed paperwork",
+        "cancelled",
+        "rejected",
+        "amendment accepted",
+    }
+)
+
+
+def _technical_response_missing_shipment_ids(po_numbers: List[str]) -> str:
+    """Message for Monday Technical response when Altruos has no shipment for one or more POs."""
+    pos = [str(p).strip() for p in (po_numbers or []) if str(p).strip()]
+    if not pos:
+        return ""
+    quoted = ", ".join(f'"{p}"' for p in pos)
+    return f"Shipment ID for po: {quoted} is not found."
+
 
 # C3 Response: raw label from email -> Monday column label (status)
 # Standard subject lines (dates/times/numbers vary); match is case-insensitive and allows suffixes like "(POs Added/Removed)", "[Scheduled Date/Time...]", " notification".
@@ -197,6 +232,32 @@ C3_RESPONSE_MAP = {
 
 # Column header to look for in update body tables (case-insensitive)
 PO_COLUMN_HEADER = "purchase order number"
+
+
+def _normalize_client_name(raw: Optional[str]) -> Optional[str]:
+    """Map LBL -> Loblaw for Client column; strip whitespace."""
+    if raw is None or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    if s.casefold() == "lbl":
+        return "Loblaw"
+    return s
+
+
+def _client_display_is_allowed(normalized_client: Optional[str]) -> bool:
+    """True if Client is Loblaw or Sobeys after normalization (LBL counts as Loblaw)."""
+    if not normalized_client or not isinstance(normalized_client, str):
+        return False
+    return normalized_client.casefold() in ALLOWED_CLIENT_CANONICAL
+
+
+def _c3_response_label_is_allowed(mapped_label: Optional[str]) -> bool:
+    """True if mapped C3 status label is in the allowed Monday label set (case-insensitive)."""
+    if not mapped_label or not isinstance(mapped_label, str):
+        return False
+    return mapped_label.strip().casefold() in ALLOWED_C3_RESPONSE_LABELS_NORMALIZED
 
 
 def _map_c3_response_to_column_label(raw: Optional[str]) -> Optional[str]:
@@ -274,6 +335,7 @@ def _items_to_csv_rows(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
             "delivery_time": delivery_time,
             "c3_response": str(it.get("c3_response") or ""),
             "row_type": str(it.get("row_type") or ""),
+            "Technical response": str(it.get("technical_response") or ""),
         }
         po_details = it.get("po_details") or []
         if po_details:
@@ -700,6 +762,14 @@ def _parse_sobeys_subject(subject: str) -> Dict[str, Optional[str]]:
     return out
 
 
+def _sobeys_subject_is_recognized(subject: str) -> bool:
+    """True if subject matches full Sobeys C3 format or Sobeys notification-only pattern."""
+    if not subject or not isinstance(subject, str):
+        return False
+    s = subject.strip()
+    return bool(SOBEYS_SUBJECT_RE.match(s) or SOBEYS_SUBJECT_NOTIFICATION_RE.match(s))
+
+
 # ---- Loblaw subject ----
 # Standard: "C3 Response - from Loblaw Appointing: ..." or "C3 Response from Loblaw Appointing: ..." (with/without hyphen, optional brackets/suffix)
 # Examples: "Appointment Confirmation Approved - from Loblaw Appointing: ...", "Appointment Rejection from Loblaw Appointing - ref# ...", "No Show Notification from Loblaw Appointing: ..."
@@ -728,6 +798,13 @@ def _parse_loblaw_subject(subject: str) -> Dict[str, Optional[str]]:
         out["c3_response"] = (c3_response or "").strip()
         out["client"] = (client or "").strip()
     return out
+
+
+def _loblaw_subject_is_recognized(subject: str) -> bool:
+    """True if subject matches Loblaw C3 / Appointing pattern."""
+    if not subject or not isinstance(subject, str):
+        return False
+    return bool(LOBLAW_C3_CLIENT_RE.match(subject.strip()))
 
 
 def _extract_loblaw_reference_number_from_body(body: str) -> Optional[str]:
@@ -1059,6 +1136,44 @@ def _update_row_type_column(
     return _monday_graphql(api_token, mutation, variables)
 
 
+def _compose_technical_response_text(extracted: Dict[str, Any]) -> str:
+    """
+    Build the same Technical response string written to Monday and the output CSV.
+    Order and conditions match _update_item_with_extracted_columns.
+    """
+    normalized_client = _normalize_client_name(extracted.get("client"))
+    c3_response_label = _map_c3_response_to_column_label(extracted.get("c3_response"))
+    c3_label_allowed = _c3_response_label_is_allowed(c3_response_label)
+    client_resolve_failed = not _client_display_is_allowed(normalized_client)
+    c3_resolve_failed = not c3_label_allowed
+
+    po_numbers = extracted.get("po_numbers") or []
+    pos_without_shipment = extracted.get("pos_without_shipment_id") or []
+
+    tech_parts: List[str] = []
+    if not po_numbers:
+        tech_parts.append(TECHNICAL_RESPONSE_NO_PO)
+    elif pos_without_shipment:
+        tech_msg = _technical_response_missing_shipment_ids(pos_without_shipment)
+        if tech_msg:
+            tech_parts.append(tech_msg)
+
+    if c3_resolve_failed:
+        tech_parts.append(TECHNICAL_RESPONSE_COULD_NOT_RESOLVE_C3)
+
+    if client_resolve_failed:
+        tech_parts.append(TECHNICAL_RESPONSE_COULD_NOT_RESOLVE_CLIENT)
+
+    if (
+        extracted.get("unexpected_email_subject")
+        and not client_resolve_failed
+        and not c3_resolve_failed
+    ):
+        tech_parts.append(TECHNICAL_RESPONSE_UNEXPECTED_SUBJECT)
+
+    return "; ".join(tech_parts) if tech_parts else ""
+
+
 def _update_item_with_extracted_columns(
     api_token: str,
     board_id: int,
@@ -1096,7 +1211,8 @@ def _update_item_with_extracted_columns(
             payload[cid] = str(value).strip() if value else ""
 
     _set(COL_APPOINTMENT_NUMBER, extracted.get("appointment_number"))
-    _set(COL_CLIENT, extracted.get("client"))
+    normalized_client = _normalize_client_name(extracted.get("client"))
+    _set(COL_CLIENT, normalized_client)
     _set(COL_CONSIGNEE, extracted.get("consignee"))
     _set(COL_APPOINTMENT_DATE, extracted.get("appointment_date_time"))
     _set(COL_REQUESTED_DELIVERY_APPOINTMENT, extracted.get("appointment_date_time"))
@@ -1104,12 +1220,16 @@ def _update_item_with_extracted_columns(
     _set(COL_ALTRUOS_SHIPMENT_ID, extracted.get("shipment_ids") or [])
     _set(COL_ALTRUOS_LOAD_ID, extracted.get("load_ids") or [])
 
-    # C3 Response is status type - map raw label to column label and set
+    # C3 Response is status type - map raw label to column label and set (only if allowed)
     c3_response_label = _map_c3_response_to_column_label(extracted.get("c3_response"))
-    if c3_response_label:
+    c3_label_allowed = _c3_response_label_is_allowed(c3_response_label)
+    if c3_response_label and c3_label_allowed:
         c3_cid = (column_by_title.get(COL_C3_RESPONSE.lower()) or {}).get("id")
         if c3_cid:
             payload[c3_cid] = {"label": c3_response_label}
+
+    client_resolve_failed = not _client_display_is_allowed(normalized_client)
+    c3_resolve_failed = not c3_label_allowed
 
     # Row Type is status type (color_mkzek1eh) - use label format
     row_type_cid = None
@@ -1120,18 +1240,41 @@ def _update_item_with_extracted_columns(
     if row_type_cid:
         payload[row_type_cid] = {"label": row_type_value}
 
-    # When no POs extracted: set Status=Failed, Action Required=Manual Review Required, Technical response message
+    # Failed Status + Technical response + Manual Review:
+    # 1) No POs from email → Technical: failed to read PO
+    # 2) POs present but Altruos shipment lookup missing → Technical: list POs not found
+    # 3) C3 response not mappable to allowed labels → Failed + Manual Review + C3 technical message
+    # 4) Client not Loblaw/Sobeys (after LBL→Loblaw) → technical: could not resolve client
+    # 5) Unrecognized subject + empty Client/Consignee → Technical only: Unexpected Email Subject
+    #    (5 is skipped if 4 already covers missing client via overlapping message)
     po_numbers = extracted.get("po_numbers") or []
+    pos_without_shipment = extracted.get("pos_without_shipment_id") or []
+    tech_cid = (column_by_title.get(COL_TECHNICAL_RESPONSE.lower()) or {}).get("id")
+    status_cid = (column_by_title.get(COL_STATUS.lower()) or {}).get("id")
+    action_cid = (column_by_title.get(COL_ACTION_REQUIRED.lower()) or {}).get("id")
+
+    tech_str = _compose_technical_response_text(extracted)
+    if tech_str and tech_cid:
+        payload[tech_cid] = tech_str
+
     if not po_numbers:
-        status_cid = (column_by_title.get(COL_STATUS.lower()) or {}).get("id")
         if status_cid:
             payload[status_cid] = {"label": STATUS_FAILED}
-        action_cid = (column_by_title.get(COL_ACTION_REQUIRED.lower()) or {}).get("id")
         if action_cid:
             payload[action_cid] = {"label": ACTION_MANUAL_REVIEW_REQUIRED}
-        tech_cid = (column_by_title.get(COL_TECHNICAL_RESPONSE.lower()) or {}).get("id")
-        if tech_cid:
-            payload[tech_cid] = TECHNICAL_RESPONSE_NO_PO
+    elif pos_without_shipment:
+        tech_msg = _technical_response_missing_shipment_ids(pos_without_shipment)
+        if tech_msg:
+            if status_cid:
+                payload[status_cid] = {"label": STATUS_FAILED}
+            if action_cid:
+                payload[action_cid] = {"label": ACTION_MANUAL_REVIEW_REQUIRED}
+
+    if c3_resolve_failed:
+        if status_cid:
+            payload[status_cid] = {"label": STATUS_FAILED}
+        if action_cid:
+            payload[action_cid] = {"label": ACTION_MANUAL_REVIEW_REQUIRED}
 
     if not payload:
         return
@@ -1590,6 +1733,23 @@ def extract_c3_appointment_details(
                 consignee = parsed_body.get("consignee")
                 po_numbers = _merge_loblaw_po_from_table(body, parsed_body.get("po_numbers"))
 
+            # LBL → Loblaw for Client column, CSV, and validation
+            client = _normalize_client_name(client)
+
+            # Unexpected subject: unrecognized pattern and no Client/Consignee after subject+body parse;
+            # flow continues; Monday "Technical response" set in _update_item_with_extracted_columns.
+            is_sobeys = "Sobeys" in name or (name and name.strip().lower().startswith("sobeys"))
+            subject_unrecognized = (
+                not _sobeys_subject_is_recognized(name)
+                if is_sobeys
+                else not _loblaw_subject_is_recognized(name)
+            )
+            client_s = (client or "").strip()
+            consignee_s = (consignee or "").strip()
+            unexpected_email_subject = bool(
+                subject_unrecognized and not client_s and not consignee_s
+            )
+
             # Determine Row Type: New (oldest occurrence) or Update (newer duplicates)
             row_type_value = ROW_TYPE_NEW
             appt = (appointment_number or "").strip()
@@ -1652,6 +1812,14 @@ def extract_c3_appointment_details(
                 load_ids = list(dict.fromkeys(load_ids))
                 po_numbers_for_output = [d.get("po", "") for d in po_details if d.get("po")]
 
+            pos_without_shipment_id: List[str] = []
+            if altruos_config and po_details:
+                for d in po_details:
+                    if (d.get("shipment_id") or "").strip().lower() == "unknown":
+                        p = (d.get("po") or "").strip()
+                        if p:
+                            pos_without_shipment_id.append(p)
+
             extracted_row = {
                 "appointment_number": appointment_number,
                 "client": client,
@@ -1661,7 +1829,10 @@ def extract_c3_appointment_details(
                 "po_numbers": po_numbers_for_output,
                 "shipment_ids": shipment_ids,
                 "load_ids": load_ids,
+                "pos_without_shipment_id": pos_without_shipment_id,
+                "unexpected_email_subject": unexpected_email_subject,
             }
+            technical_response = _compose_technical_response_text(extracted_row)
 
             # Populate all columns on Monday: Appointment #, Client, Consignee, Appointment Date,
             # Requested Delivery Appointment, PO, Altruos Shipment ID, Altruos Load ID, Row Type
@@ -1681,6 +1852,7 @@ def extract_c3_appointment_details(
                 "c3_response": c3_response,
                 "po_numbers": po_numbers_for_output,
                 "row_type": row_type_value,
+                "technical_response": technical_response,
             }
             if po_details:
                 result_item["po_details"] = po_details
