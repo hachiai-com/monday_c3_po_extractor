@@ -180,7 +180,7 @@ TECHNICAL_RESPONSE_COULD_NOT_RESOLVE_CLIENT = (
     "Could not resolve client - Unexpected Email Subject"
 )
 TECHNICAL_RESPONSE_COULD_NOT_RESOLVE_C3 = (
-    "could not resolve C3 response - Unexpected Email Subject"
+    "Unexpected Email Subject"
 )
 
 # Client column must be one of these (case-insensitive); "LBL" is stored as "Loblaw"
@@ -207,19 +207,19 @@ def _technical_response_missing_shipment_ids(po_numbers: List[str]) -> str:
     if not pos:
         return ""
     quoted = ", ".join(f'"{p}"' for p in pos)
-    return f"Shipment ID for po: {quoted} is not found."
+    return f"Shipment ID not found - POs: {quoted}"
 
 
 # C3 Response: raw label from email -> Monday column label (status)
 # Standard subject lines (dates/times/numbers vary); match is case-insensitive and allows suffixes like "(POs Added/Removed)", "[Scheduled Date/Time...]", " notification".
-# Sobeys: Reservation Approval->Approved, Update->Update, No Show Appointment->No show, Missing/Incorrect paperwork->Missing/Incorrect Paperwork, Signed paperwork->Signed Paperwork
+# Sobeys: Reservation Approval->Approved, Update->Update, No Show Appointment->No Show, Missing/Incorrect paperwork->Missing/Incorrect Paperwork, Signed paperwork->Signed Paperwork
 # Loblaw: Appointment Confirmation Approved->Approved, Appointment Cancellation Request Approved->Cancelled, Appointment Rejection->Rejected, No Show Notification->No Show,
 #         Amendment Accepted (any variant)->Amendment Accepted
 C3_RESPONSE_MAP = {
     # Sobeys
     "reservation approval": "Approved",
     "update": "Update",
-    "no show appointment": "No show",
+    "no show appointment": "No Show",
     "missing/incorrect paperwork": "Missing/Incorrect Paperwork",
     "signed paperwork": "Signed Paperwork",
     # Loblaw
@@ -1849,7 +1849,7 @@ def extract_c3_appointment_details(
                 "client": client,
                 "consignee": consignee,
                 "appointment_date_time": appointment_date_time,
-                "c3_response": c3_response,
+                "c3_response": (_map_c3_response_to_column_label(c3_response) or c3_response),
                 "po_numbers": po_numbers_for_output,
                 "row_type": row_type_value,
                 "technical_response": technical_response,
