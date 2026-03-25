@@ -150,7 +150,7 @@ ROW_TYPE_COLUMN_TITLE = "Row Type"
 CREATION_LOG_COLUMN_TITLE = "Creation log"
 # Test filter: when use_test_filter=True, run only on rows with this label in "Dropdown" column
 DROPDOWN_COLUMN_TITLE = "Dropdown"
-TEST_READY_LABEL = "test 2"
+TEST_READY_LABEL = "hachiai-internal-test"
 DEV_LIMIT_ROWS = 2
 # Loblaw "past 2 weeks" filter: column for date (board-specific)
 LOBLAW_DATE_COLUMN_ID = "pulse_log_mkypz8ad"
