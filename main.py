@@ -9,7 +9,7 @@ Monday C3 PO Extractor Toolkit.
   and extracts appointment number, Client, Consignee, Appointment Date and time, C3 Response, POs
   from Sobeys or Loblaw email format. When config_path is provided, also looks up Altruos Shipment ID
   (per PO via shipments/search) and Altruos Load ID (per Shipment ID via movements/search/shipments)
-  and populates those Monday columns; the output CSV includes shipment_id, load_id, and Technical response per PO row.
+  and populates those Monday columns; the output CSV includes email_subject (from the Email column), shipment_id, load_id, and Technical response per PO row.
 - start_extract_c3_appointment: Starts the same extraction in the background; returns job_id and
   status "started" immediately so agentic platforms can avoid timeouts. Poll check_job_status with job_id.
 - check_job_status: Returns job status (started/running/completed/failed), progress, and when
@@ -18,6 +18,7 @@ Monday C3 PO Extractor Toolkit.
 
 import csv
 import json
+import logging
 import os
 import re
 import subprocess
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import requests
+from execution_file_log import run_with_execution_log
 
 try:
     from requests_aws4auth import AWS4Auth
@@ -35,11 +37,18 @@ try:
 except ImportError:
     _HAS_AWS4AUTH = False
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 # Filename for saving extracted appointment items (user Downloads) as CSV, one row per PO
 NEW_RECORDS_FILENAME = "new_records.csv"
 
 # CSV column headers (one row per PO; date=YYYYMMDD, delivery_time=HHMMSS)
 CSV_HEADERS = [
+    "email_subject",
     "item_id",
     "appointment_number",
     "client",
@@ -150,7 +159,7 @@ ROW_TYPE_COLUMN_TITLE = "Row Type"
 CREATION_LOG_COLUMN_TITLE = "Creation log"
 # Test filter: when use_test_filter=True, run only on rows with this label in "Dropdown" column
 DROPDOWN_COLUMN_TITLE = "Dropdown"
-TEST_READY_LABEL = "hachiai-internal-test"
+TEST_READY_LABEL = "2 April test"
 DEV_LIMIT_ROWS = 2
 # Loblaw "past 2 weeks" filter: column for date (board-specific)
 LOBLAW_DATE_COLUMN_ID = "pulse_log_mkypz8ad"
@@ -170,6 +179,7 @@ COL_ALTRUOS_LOAD_ID = "Altruos Load ID"
 COL_STATUS = "Status"
 COL_ACTION_REQUIRED = "Action Required"
 COL_TECHNICAL_RESPONSE = "Technical response"
+COL_EMAIL = "Email"
 
 # When no POs extracted from email body:
 STATUS_FAILED = "Failed"
@@ -212,7 +222,9 @@ def _technical_response_missing_shipment_ids(po_numbers: List[str]) -> str:
 
 # C3 Response: raw label from email -> Monday column label (status)
 # Standard subject lines (dates/times/numbers vary); match is case-insensitive and allows suffixes like "(POs Added/Removed)", "[Scheduled Date/Time...]", " notification".
-# Sobeys: Reservation Approval->Approved, Update->Update, No Show Appointment->No Show, Missing/Incorrect paperwork->Missing/Incorrect Paperwork, Signed paperwork->Signed Paperwork
+# Sobeys: Reservation Approval->Approved, Update->Update, No Show Appointment->No Show,
+#         Missing/Incorrect paperwork->Missing/Incorrect Paperwork, Signed paperwork->Signed Paperwork,
+#         Amendment Rejected->Rejected
 # Loblaw: Appointment Confirmation Approved->Approved, Appointment Cancellation Request Approved->Cancelled, Appointment Rejection->Rejected, No Show Notification->No Show,
 #         Amendment Accepted (any variant)->Amendment Accepted
 C3_RESPONSE_MAP = {
@@ -222,6 +234,7 @@ C3_RESPONSE_MAP = {
     "no show appointment": "No Show",
     "missing/incorrect paperwork": "Missing/Incorrect Paperwork",
     "signed paperwork": "Signed Paperwork",
+    "amendment rejected": "Rejected",
     # Loblaw
     "appointment confirmation approved": "Approved",
     "appointment cancellation request approved": "Cancelled",
@@ -229,6 +242,8 @@ C3_RESPONSE_MAP = {
     "no show notification": "No Show",
     "amendment accepted": "Amendment Accepted",
 }
+
+SOBEYS_AMENDMENT_REJECTED_SUBSTRING = "amendment rejected"
 
 # Column header to look for in update body tables (case-insensitive)
 PO_COLUMN_HEADER = "purchase order number"
@@ -327,6 +342,7 @@ def _items_to_csv_rows(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         raw_datetime = str(it.get("appointment_date_time") or "")
         appointment_date, delivery_time = _format_appointment_date_time_for_csv(raw_datetime)
         base = {
+            "email_subject": str(it.get("email_subject") or ""),
             "item_id": str(it.get("item_id") or ""),
             "appointment_number": str(it.get("appointment_number") or ""),
             "client": str(it.get("client") or ""),
@@ -749,7 +765,11 @@ def _parse_sobeys_subject(subject: str) -> Dict[str, Optional[str]]:
     if m:
         client, c3_response, appt_no, date_time, consignee = m.groups()
         out["client"] = (client or "").strip()
-        out["c3_response"] = (c3_response or "").strip()
+        c3_response_clean = (c3_response or "").strip()
+        if SOBEYS_AMENDMENT_REJECTED_SUBSTRING in c3_response_clean.casefold():
+            # Normalize new Sobeys subject family to ensure Monday C3 Response maps to "Rejected".
+            c3_response_clean = "Amendment Rejected"
+        out["c3_response"] = c3_response_clean
         out["appointment_number"] = (appt_no or "").strip()
         out["appointment_date_time"] = (date_time or "").strip()
         out["consignee"] = (consignee or "").strip()
@@ -1034,6 +1054,66 @@ def _get_column_value_text_by_id(
                 pass
         return None
     return None
+
+
+def _coerce_column_value_json(raw: Any) -> Any:
+    """Parse Monday column `value` when it is a JSON string; pass through dict."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
+
+
+def _find_subject_in_json_blob(data: Any, depth: int = 0) -> Optional[str]:
+    """Find first non-empty string for key 'subject' (any casing) in nested dict/list."""
+    if depth > 6 or data is None:
+        return None
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if str(k).lower() == "subject" and isinstance(v, str) and v.strip():
+                return v.strip()
+        for v in data.values():
+            found = _find_subject_in_json_blob(v, depth + 1)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for el in data:
+            found = _find_subject_in_json_blob(el, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _email_subject_from_column_values(
+    column_values: List[Dict[str, Any]],
+    email_column_id: Optional[str],
+) -> str:
+    """
+    Read subject line from the board's Email column (column id from title 'Email').
+    Uses `value` JSON (subject key) when present, else the column's `text` field.
+    """
+    if not email_column_id or not column_values:
+        return ""
+    eid = email_column_id.strip().lower()
+    for cv in column_values:
+        if (cv.get("id") or "").strip().lower() != eid:
+            continue
+        parsed = _coerce_column_value_json(cv.get("value"))
+        if parsed is not None:
+            subj = _find_subject_in_json_blob(parsed)
+            if subj:
+                return subj
+        text = (cv.get("text") or "").strip()
+        if text:
+            return text
+        return ""
+    return ""
 
 
 def _fetch_column_values_for_items(
@@ -1523,7 +1603,8 @@ def extract_c3_appointment_details(
     Extracts appointment_number, client, consignee, appointment_date_time, c3_response,
     po_numbers. When config_path is provided, also looks up Altruos Shipment ID and Load ID
     via API (PO -> shipments/search, Shipment ID -> movements/search/shipments).
-    Supports Sobeys and Loblaw email formats.
+    Supports Sobeys and Loblaw email formats. Saved CSV includes email_subject from the Email column
+    (falls back to item name if the column is missing or yields no subject).
     If progress_callback is provided, it is called with {"items_total": n, "items_processed": i}.
     """
     try:
@@ -1663,6 +1744,13 @@ def extract_c3_appointment_details(
         for i in range(0, len(item_ids), 50):
             batch = item_ids[i : i + 50]
             updates_by_item.update(_fetch_updates_for_items(token, batch))
+
+        email_column_id = (column_by_title.get(COL_EMAIL.lower()) or {}).get("id") or None
+        cv_by_item_for_email: Dict[str, List[Dict[str, Any]]] = {}
+        if email_column_id and item_ids:
+            for i in range(0, len(item_ids), 50):
+                batch = item_ids[i : i + 50]
+                cv_by_item_for_email.update(_fetch_column_values_for_items(token, batch))
 
         # Precompute for Loblaw: ref # -> oldest item_id (past 2 weeks, creation order). That item = New, others = Update.
         loblaw_oldest_item_id_per_ref = _get_loblaw_oldest_item_id_per_reference(token, bid, weeks=2)
@@ -1843,7 +1931,15 @@ def extract_c3_appointment_details(
             except Exception as update_err:
                 row_type_value = f"{row_type_value} (update failed: {update_err})"
 
+            if email_column_id:
+                cvs_email = cv_by_item_for_email.get(iid) or []
+                subj_col = _email_subject_from_column_values(cvs_email, email_column_id).strip()
+                email_subject_out = subj_col or name
+            else:
+                email_subject_out = name
+
             result_item: Dict[str, Any] = {
+                "email_subject": email_subject_out,
                 "item_id": iid,
                 "appointment_number": appointment_number,
                 "client": client,
@@ -2073,7 +2169,30 @@ def main() -> None:
                 config_path=args.get("config_path"),
                 use_test_filter=bool(args.get("use_test_filter")),
             )
+            # Keep the original detailed terminal output for visibility/debugging.
             print(json.dumps(result, indent=2))
+            if "error" in result:
+                print(
+                    json.dumps(
+                        {
+                            "error": result.get("error"),
+                            "status": "error",
+                            "capability": CAPABILITY_APPOINTMENT,
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(
+                    json.dumps(
+                        {
+                            "saved_path": (result.get("result") or {}).get("saved_path", ""),
+                            "status": "success",
+                            "capability": CAPABILITY_APPOINTMENT,
+                        },
+                        indent=2,
+                    )
+                )
         elif capability == CAPABILITY_START_APPOINTMENT:
             result = start_extract_c3_appointment(args)
             print(json.dumps(result, indent=2))
@@ -2106,4 +2225,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_with_execution_log(main)

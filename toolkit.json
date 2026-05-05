@@ -3,7 +3,7 @@
   "display_name": "Monday C3 PO Extractor",
   "description": "Extracts PO numbers and full appointment details (appointment_number, client, consignee, appointment_date_time, c3_response, po_numbers) from Monday.com C3 board updates. Supports Sobeys and Loblaw email formats. Use start_extract_c3_appointment + check_job_status for long-running runs to avoid timeouts.",
   "version": "0.3.0",
-  "timeout": 660,
+  "timeout": 360,
   "entrypoint": {
     "type": "python",
     "command": "python main.py"
